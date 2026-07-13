@@ -28,6 +28,21 @@ fn augmented_path() -> String {
     parts.join(":")
 }
 
+/// Build a `Command` that never flashes a console window on Windows. Every
+/// subprocess (git polls run constantly) must go through this, otherwise each
+/// spawn pops a cmd window that steals focus — on Windows the app looks like
+/// it's flickering a terminal nonstop.
+fn command(program: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Run a git command inside `repo`, returning stdout on success or stderr on failure.
 fn run_git(repo: &str, args: &[&str]) -> Result<String, String> {
     run_git_auth(repo, args, None)
@@ -56,7 +71,7 @@ fn is_lfs_missing(err: &str) -> bool {
 /// is always set so git fails fast instead of hanging on an interactive prompt
 /// (the token is passed through the environment, never on the argv).
 fn run_git_auth(repo: &str, args: &[&str], token: Option<&str>) -> Result<String, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = command("git");
     cmd.arg("-C").arg(repo);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("PATH", augmented_path());
@@ -472,7 +487,7 @@ pub struct DepInfo {
 /// using the same augmented PATH the git subprocesses get so the result matches
 /// what the app can actually run.
 fn probe_dep(bin: &str, version_args: &[&str]) -> DepInfo {
-    let path = Command::new("sh")
+    let path = command("sh")
         .env("PATH", augmented_path())
         .arg("-c")
         .arg(format!("command -v {bin}"))
@@ -481,7 +496,7 @@ fn probe_dep(bin: &str, version_args: &[&str]) -> DepInfo {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    let version = Command::new(bin)
+    let version = command(bin)
         .env("PATH", augmented_path())
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(version_args)
@@ -565,7 +580,7 @@ fn unmerged_files(repo: &str) -> Vec<String> {
 fn launch_kaleidoscope_mergetool(repo: &str) -> Result<(), String> {
     let cmd_cfg = "mergetool.kaleidoscope.cmd=ksdiff --merge --output \"$MERGED\" \
                    --base \"$BASE\" -- \"$LOCAL\" \"$REMOTE\"";
-    let out = Command::new("git")
+    let out = command("git")
         .arg("-C")
         .arg(repo)
         .env("PATH", augmented_path())
@@ -618,7 +633,7 @@ pub async fn git_cherry_pick_preflight(
             Ok(p) if !p.trim().is_empty() => p.trim().to_string(),
             _ => EMPTY_TREE.to_string(),
         };
-        let out = Command::new("git")
+        let out = command("git")
             .arg("-C")
             .arg(&path)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -894,6 +909,81 @@ pub async fn git_create_branch(
     .await
 }
 
+#[derive(serde::Serialize)]
+pub struct TagInfo {
+    pub name: String,
+    pub target: String,
+    pub date: String,
+    pub subject: String,
+}
+
+/// List all tags, newest first. `target` is the short hash the tag points at,
+/// `subject` the annotation message subject (or the commit subject for
+/// lightweight tags).
+#[tauri::command]
+pub async fn git_tags(path: String) -> Result<Vec<TagInfo>, String> {
+    run_blocking(move || {
+        let out = run_git(
+            &path,
+            &[
+                "for-each-ref",
+                "--sort=-creatordate",
+                "refs/tags",
+                "--format=%(refname:short)\x1f%(objectname:short)\x1f%(creatordate:short)\x1f%(contents:subject)",
+            ],
+        )?;
+        let mut tags = Vec::new();
+        for line in out.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.splitn(4, '\x1f').collect();
+            tags.push(TagInfo {
+                name: f.first().unwrap_or(&"").to_string(),
+                target: f.get(1).unwrap_or(&"").to_string(),
+                date: f.get(2).unwrap_or(&"").to_string(),
+                subject: f.get(3).unwrap_or(&"").to_string(),
+            });
+        }
+        Ok(tags)
+    })
+    .await
+}
+
+/// Create a tag on the current HEAD. A non-empty `message` makes it an
+/// annotated tag (`git tag -a`, records tagger + date); an empty one makes a
+/// lightweight tag (a bare pointer).
+#[tauri::command]
+pub async fn git_create_tag(path: String, name: String, message: String) -> Result<(), String> {
+    run_blocking(move || {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("标签名不能为空".into());
+        }
+        let msg = message.trim();
+        if msg.is_empty() {
+            run_git(&path, &["tag", name])?;
+        } else {
+            run_git(&path, &["tag", "-a", name, "-m", msg])?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Push a single tag to `origin`.
+#[tauri::command]
+pub async fn git_push_tag(path: String, name: String, token: Option<String>) -> Result<(), String> {
+    run_blocking(move || {
+        let n = name.trim();
+        if n.is_empty() {
+            return Err("标签名不能为空".into());
+        }
+        run_git_auth(&path, &["push", "origin", n], token.as_deref()).map(|_| ())
+    })
+    .await
+}
+
 /// Stash working-tree changes (including untracked files).
 #[tauri::command]
 pub async fn git_stash_push(path: String, message: String) -> Result<(), String> {
@@ -956,7 +1046,7 @@ pub async fn git_merge_preview(
     target: String,
 ) -> Result<MergePreview, String> {
     run_blocking(move || {
-        let out = Command::new("git")
+        let out = command("git")
             .arg("-C")
             .arg(&path)
             .env("GIT_TERMINAL_PROMPT", "0")

@@ -58,6 +58,16 @@ pub fn run() {
                     );
                 }
             }
+            // Windows has no equivalent of macOS's Overlay title bar, so drop the
+            // native decorations and let the app draw its own immersive top bar +
+            // window controls (see WindowControls in the frontend).
+            #[cfg(target_os = "windows")]
+            {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_decorations(false);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -85,6 +95,9 @@ pub fn run() {
             git::git_cherry_pick,
             git::git_cherry_pick_preflight,
             git::git_create_branch,
+            git::git_tags,
+            git::git_create_tag,
+            git::git_push_tag,
             git::git_checkout_sync,
             git::git_commit,
             git::git_fetch,
