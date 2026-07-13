@@ -352,27 +352,28 @@ pub struct StatusEntry {
 #[tauri::command]
 pub async fn git_status(path: String) -> Result<Vec<StatusEntry>, String> {
     run_blocking(move || {
-    // `-uall` lists every untracked file individually; without it git collapses a
-    // fully-untracked directory into a single `dir/` entry, which hides the files
-    // and breaks staging (update-index can't take a directory path).
-    let out = run_git(
-        &path,
-        &["-c", "core.quotepath=false", "status", "--porcelain", "-uall"],
-    )?;
+    // `-z` emits NUL-separated, UNQUOTED paths. The default porcelain output wraps
+    // any path with a space, non-ASCII byte (e.g. 中文), or quote in C-style quotes
+    // (`core.quotepath=false` does NOT stop this), and the app then stored the
+    // literal quoted string — so staging that path on commit failed ("git 命令失败").
+    // `-uall` lists untracked files individually instead of collapsing directories.
+    let out = run_git(&path, &["status", "--porcelain", "-uall", "-z"])?;
     let mut res = Vec::new();
-    for line in out.lines() {
-        if line.len() < 3 {
+    let mut fields = out.split('\0');
+    while let Some(entry) = fields.next() {
+        // Records are "XY <path>"; the trailing empty field after the last NUL and
+        // any short/garbage record are skipped.
+        if entry.len() < 4 {
             continue;
         }
-        let x = &line[0..1];
-        let y = &line[1..2];
-        let rest = &line[3..];
-        // Renames/copies are shown as "old -> new"; keep the new path.
-        let p = if let Some(idx) = rest.find(" -> ") {
-            rest[idx + 4..].to_string()
-        } else {
-            rest.to_string()
-        };
+        let x = &entry[0..1];
+        let y = &entry[1..2];
+        let p = entry[3..].to_string();
+        // A rename/copy (R/C in either column) carries its source path as the NEXT
+        // NUL-separated field; consume it and keep the new path we already have.
+        if x == "R" || x == "C" || y == "R" || y == "C" {
+            let _ = fields.next();
+        }
         let staged = x != " " && x != "?";
         res.push(StatusEntry {
             path: p,
@@ -394,31 +395,51 @@ pub struct FileStat {
     pub deletions: u32,
 }
 
-/// Files changed in a commit, with per-file add/delete counts.
-#[tauri::command]
-pub async fn commit_files(path: String, hash: String) -> Result<Vec<FileStat>, String> {
-    run_blocking(move || {
-    let numstat = run_git(&path, &["show", "--format=", "--numstat", "-M", &hash])?;
+/// Parse paired `--numstat -z` + `--name-status -z` output into per-file stats.
+/// `-z` gives NUL-separated, UNQUOTED paths (spaces / 中文 / quotes survive intact),
+/// which the newline form would wrap in C-style quotes and corrupt. A rename/copy
+/// carries its old + new paths as two extra NUL fields in BOTH streams; we keep the
+/// new path. numstat marks a rename with an empty path column; name-status with an
+/// `R`/`C` status letter.
+fn parse_diff_files(numstat: &str, names: &str) -> Vec<FileStat> {
     let mut adds: std::collections::HashMap<String, (u32, u32)> = std::collections::HashMap::new();
-    for line in numstat.lines() {
-        let cols: Vec<&str> = line.split('\t').collect();
+    let mut it = numstat.split('\0');
+    while let Some(field) = it.next() {
+        if field.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = field.splitn(3, '\t').collect();
         if cols.len() < 3 {
             continue;
         }
         let a = cols[0].parse::<u32>().unwrap_or(0);
         let d = cols[1].parse::<u32>().unwrap_or(0);
-        adds.insert(cols[2].to_string(), (a, d));
+        let p = if cols[2].is_empty() {
+            let _old = it.next();
+            it.next().unwrap_or("").to_string()
+        } else {
+            cols[2].to_string()
+        };
+        if !p.is_empty() {
+            adds.insert(p, (a, d));
+        }
     }
-    let names = run_git(&path, &["show", "--format=", "--name-status", "-M", &hash])?;
     let mut res = Vec::new();
-    for line in names.lines() {
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 2 {
+    let mut it = names.split('\0');
+    while let Some(status) = it.next() {
+        if status.is_empty() {
             continue;
         }
-        let letter = cols[0].chars().next().unwrap_or('M').to_string();
-        // For renames (R…) the last column is the new path.
-        let p = cols[cols.len() - 1].to_string();
+        let letter = status.chars().next().unwrap_or('M').to_string();
+        let p = if letter == "R" || letter == "C" {
+            let _old = it.next();
+            it.next().unwrap_or("").to_string()
+        } else {
+            it.next().unwrap_or("").to_string()
+        };
+        if p.is_empty() {
+            continue;
+        }
         let (a, d) = adds.get(&p).copied().unwrap_or((0, 0));
         res.push(FileStat {
             path: p,
@@ -427,7 +448,16 @@ pub async fn commit_files(path: String, hash: String) -> Result<Vec<FileStat>, S
             deletions: d,
         });
     }
-    Ok(res)
+    res
+}
+
+/// Files changed in a commit, with per-file add/delete counts.
+#[tauri::command]
+pub async fn commit_files(path: String, hash: String) -> Result<Vec<FileStat>, String> {
+    run_blocking(move || {
+        let numstat = run_git(&path, &["show", "--format=", "--numstat", "-M", "-z", &hash])?;
+        let names = run_git(&path, &["show", "--format=", "--name-status", "-M", "-z", &hash])?;
+        Ok(parse_diff_files(&numstat, &names))
     })
     .await
 }
@@ -567,10 +597,11 @@ fn parse_merge_tree_conflicts(stdout: &str) -> Vec<String> {
 /// Paths with unmerged (conflicted) index entries — i.e. what's left to resolve
 /// while a cherry-pick/merge is in progress.
 fn unmerged_files(repo: &str) -> Vec<String> {
-    run_git(repo, &["diff", "--name-only", "--diff-filter=U"])
+    // `-z` → NUL-separated, unquoted paths (safe for spaces / 中文).
+    run_git(repo, &["diff", "--name-only", "--diff-filter=U", "-z"])
         .map(|s| {
-            s.lines()
-                .map(|l| l.trim().to_string())
+            s.split('\0')
+                .map(|l| l.to_string())
                 .filter(|l| !l.is_empty())
                 .collect()
         })
@@ -1126,30 +1157,9 @@ pub async fn git_stash_files(path: String, index: usize) -> Result<Vec<FileStat>
     run_blocking(move || {
         let base = format!("stash@{{{index}}}^1");
         let stash = format!("stash@{{{index}}}");
-        let numstat = run_git(&path, &["diff", "--numstat", "-M", &base, &stash])?;
-        let mut adds: std::collections::HashMap<String, (u32, u32)> = std::collections::HashMap::new();
-        for line in numstat.lines() {
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() < 3 {
-                continue;
-            }
-            let a = cols[0].parse::<u32>().unwrap_or(0);
-            let d = cols[1].parse::<u32>().unwrap_or(0);
-            adds.insert(cols[2].to_string(), (a, d));
-        }
-        let names = run_git(&path, &["diff", "--name-status", "-M", &base, &stash])?;
-        let mut res = Vec::new();
-        for line in names.lines() {
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() < 2 {
-                continue;
-            }
-            let letter = cols[0].chars().next().unwrap_or('M').to_string();
-            let p = cols[cols.len() - 1].to_string();
-            let (a, d) = adds.get(&p).copied().unwrap_or((0, 0));
-            res.push(FileStat { path: p, status: letter, additions: a, deletions: d });
-        }
-        Ok(res)
+        let numstat = run_git(&path, &["diff", "--numstat", "-M", "-z", &base, &stash])?;
+        let names = run_git(&path, &["diff", "--name-status", "-M", "-z", &base, &stash])?;
+        Ok(parse_diff_files(&numstat, &names))
     })
     .await
 }
@@ -1355,6 +1365,19 @@ fn github_api_base(url: &str) -> String {
     }
 }
 
+/// Open a URL in the user's default browser (cross-platform: macOS `open`,
+/// Windows `cmd /C start`, other unix `xdg-open`). Best-effort; errors ignored.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
 /// Create a merge/pull request on the remote and open it in the browser.
 /// Returns the web URL of the created request.
 #[tauri::command]
@@ -1441,7 +1464,7 @@ pub async fn create_pull_request(
     };
 
     if !web_url.is_empty() {
-        let _ = std::process::Command::new("open").arg(&web_url).spawn();
+        open_in_browser(&web_url);
     }
     Ok(web_url)
 }
