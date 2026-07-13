@@ -1,0 +1,52 @@
+@import './tailwind.css';
+@import './theme.css';
+
+/* Mac-native system font stack (offline, no web fonts) */
+html, body {
+  margin: 0;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    system-ui, "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+#root { height: 100vh; }
+
+/* Commit-detail content fade (on open + on switching commits) */
+@keyframes gk-detail-in {
+  from { opacity: 0; transform: translateX(10px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.gk-detail-in { animation: gk-detail-in 0.2s cubic-bezier(0.32, 0.72, 0, 1); }
+
+/* Detail panel slide-in from the right when it opens */
+@keyframes gk-panel-in {
+  from { opacity: 0; transform: translateX(88px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.gk-panel-in { animation: gk-panel-in 0.28s cubic-bezier(0.32, 0.72, 0, 1); }
+
+/* Detail panel slide-out to the right when it closes */
+@keyframes gk-panel-out {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(88px); }
+}
+.gk-panel-out { animation: gk-panel-out 0.22s cubic-bezier(0.4, 0, 1, 1) forwards; }
+
+/* Dialog entrance (backdrop fade + panel scale) — transform/opacity only, cheap */
+@keyframes gk-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes gk-modal-in {
+  from { opacity: 0; transform: scale(0.96) translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+.gk-overlay-in { animation: gk-overlay-in 0.16s ease-out; }
+.gk-modal-in   { animation: gk-modal-in 0.18s cubic-bezier(0.32, 0.72, 0, 1); }
+
+/* Timeline reveal after a project switch: the freshly-loaded history fades in
+   from a soft blur, so the async load reads as "loading → resolved" rather than
+   a hard pop. Keyed by repo path in App so it re-fires on every switch. */
+@keyframes gk-reveal {
+  from { opacity: 0; filter: blur(8px); }
+  to   { opacity: 1; filter: blur(0); }
+}
+.gk-reveal { animation: gk-reveal 0.26s cubic-bezier(0.32, 0.72, 0, 1); }

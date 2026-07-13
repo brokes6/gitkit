@@ -1,0 +1,75 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# tauri-action 需要写权限来创建 Release 并上传产物
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS：通用二进制，一个包同时覆盖 Intel(x86_64) 与 Apple Silicon(arm64)
+          - platform: macos-latest
+            args: '--target universal-apple-darwin'
+            rust-targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
+          # Windows：x64
+          - platform: windows-latest
+            args: ''
+            rust-targets: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build & release (Tauri)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 自动更新包的 minisign 签名（客户端用内置 pubkey 校验）
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # 版本号取自 tauri.conf.json，tag 名如 v0.1.0
+          tagName: v__VERSION__
+          releaseName: 'GitKit v__VERSION__'
+          releaseBody: |
+            自动构建产物：macOS 通用包(.dmg / .app.tar.gz) 与 Windows(.exe / .msi)。
+
+            客户端「设置 → 检查更新」可自动更新到本版本。
+
+            注意：本版本未做 Apple / Windows 代码签名，首次打开需绕过系统拦截
+            （macOS 右键→打开；Windows 点“更多信息→仍要运行”）。
+          # 先出草稿 Release，人工确认后再点 Publish；发布后自动更新才会对客户端生效
+          releaseDraft: true
+          prerelease: false
+          # 合并各平台的 latest.json，供 updater 插件消费
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}

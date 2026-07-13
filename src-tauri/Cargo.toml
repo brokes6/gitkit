@@ -1,0 +1,28 @@
+[package]
+name = "gitkit"
+version = "0.1.0"
+description = "GitKit — a native Git client for macOS"
+edition = "2021"
+
+[lib]
+name = "gitkit_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-dialog = "2"
+reqwest = { version = "0.13", features = ["json"] }
+tokio = { version = "1", features = ["rt"] }
+
+[target."cfg(target_os = \"macos\")".dependencies]
+window-vibrancy = "0.6"
+
+[target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+tauri-plugin-window-state = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
