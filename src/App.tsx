@@ -2125,7 +2125,6 @@ function saveConn(key: string, c: RemoteConn): void {
   try { localStorage.setItem(key, JSON.stringify(c)); } catch { /* ignore */ }
 }
 const loadGitlab = () => loadConn("gitkit.gitlab");
-const loadGithub = () => loadConn("gitkit.github");
 
 // Host of a remote URL (https or scp-style git@host:path); "" for none.
 function hostOf(url: string): string {
@@ -2133,17 +2132,57 @@ function hostOf(url: string): string {
   const m = url.match(/^[^@]+@([^:/]+)/);
   return m ? m[1] : "";
 }
-// Pick the token whose configured host matches the remote (GitHub public is
-// special-cased); falls back to whichever single token is configured.
-function pickRemoteToken(remoteUrl: string): string | undefined {
+
+// GitHub supports multiple accounts (label + optional GHE url + token), so one
+// user can push different projects under different identities. Public accounts
+// leave `url` blank; GitHub Enterprise accounts set it to the instance root.
+interface GithubAccount { id: string; label: string; url: string; token: string }
+function loadGithubAccounts(): GithubAccount[] {
+  try {
+    const raw = localStorage.getItem("gitkit.github.accounts");
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        return arr
+          .filter((a) => a && typeof a.token === "string" && a.token)
+          .map((a, i) => ({
+            id: String(a.id ?? `gh-${i}`),
+            label: typeof a.label === "string" ? a.label : "",
+            url: typeof a.url === "string" ? a.url : "",
+            token: a.token as string,
+          }));
+      }
+    }
+  } catch { /* ignore */ }
+  // Migrate the legacy single-connection config into one account.
+  const legacy = loadConn("gitkit.github");
+  if (legacy.token) return [{ id: "gh-legacy", label: legacy.url ? hostOf(legacy.url) : "github.com", url: legacy.url, token: legacy.token }];
+  return [];
+}
+function saveGithubAccounts(list: GithubAccount[]): void {
+  try { localStorage.setItem("gitkit.github.accounts", JSON.stringify(list)); } catch { /* ignore */ }
+}
+// GitHub accounts whose configured host matches the remote: a blank-url account
+// serves public github.com; a GHE account serves only its own host.
+function githubCandidates(remoteUrl: string): GithubAccount[] {
+  const accts = loadGithubAccounts();
   const host = hostOf(remoteUrl);
-  const gh = loadGithub(), gl = loadGitlab();
-  if (host) {
-    const isGithub = host === "github.com" || host.endsWith(".github.com") || (gh.url && host === hostOf(gh.url));
-    if (isGithub && gh.token) return gh.token;
-    if (gl.url && host === hostOf(gl.url) && gl.token) return gl.token;
-  }
-  return gl.token || gh.token || undefined;
+  if (!host) return accts;
+  const isPublic = host === "github.com" || host.endsWith(".github.com");
+  return accts.filter((a) => (a.url ? host === hostOf(a.url) : isPublic));
+}
+
+// Pick the token whose configured host matches the remote (GitHub public is
+// special-cased); falls back to whichever single token is configured. This is
+// the non-interactive fallback; `resolveRemoteToken` handles the multi-account
+// prompt before delegating here.
+function pickRemoteToken(remoteUrl: string): string | undefined {
+  const cands = githubCandidates(remoteUrl);
+  if (cands.length) return cands[0].token;
+  const gl = loadGitlab();
+  const host = hostOf(remoteUrl);
+  if (host && gl.url && host === hostOf(gl.url) && gl.token) return gl.token;
+  return gl.token || loadGithubAccounts()[0]?.token || undefined;
 }
 
 // ─── Modal shell (shared style for all dialogs) ──────────────────────────────
@@ -2766,6 +2805,139 @@ function RemoteConnSettings({ storageKey, title, desc, urlPlaceholder, tokenPlac
   );
 }
 
+// GitHub integration: multiple accounts (label + optional GHE url + token) so one
+// person can push different projects under different identities. Push / PR flows
+// pick the account matching the remote host; when several match, the app prompts.
+// Persisted to localStorage, migrated from the legacy single connection.
+function GithubAccountsSettings() {
+  const t = useTheme();
+  const [accounts, setAccounts] = useState<GithubAccount[]>(loadGithubAccounts);
+  const [label, setLabel] = useState("");
+  const [url, setUrl] = useState("");
+  const [token, setToken] = useState("");
+  const [showToken, setShowToken] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [status, setStatus] = useState<{ kind: "idle" | "testing" | "ok" | "err"; msg?: string }>({ kind: "idle" });
+
+  useEffect(() => { saveGithubAccounts(accounts); }, [accounts]);
+
+  const valid = token.trim().length > 0;
+  const reset = () => { setLabel(""); setUrl(""); setToken(""); setEditingId(null); setStatus({ kind: "idle" }); setShowToken(false); };
+  const submit = () => {
+    if (!valid) return;
+    const l = label.trim(), u = url.trim(), tk = token.trim();
+    if (editingId) {
+      setAccounts((prev) => prev.map((a) => a.id === editingId ? { ...a, label: l, url: u, token: tk } : a));
+    } else {
+      setAccounts((prev) => [...prev, { id: "gh-" + Date.now(), label: l, url: u, token: tk }]);
+    }
+    reset();
+  };
+  const startEdit = (a: GithubAccount) => { setEditingId(a.id); setLabel(a.label); setUrl(a.url); setToken(a.token); setStatus({ kind: "idle" }); };
+  const remove = (id: string) => { setAccounts((prev) => prev.filter((a) => a.id !== id)); if (editingId === id) reset(); };
+
+  const canTest = token.trim().length > 0 && status.kind !== "testing";
+  const runTest = async () => {
+    if (!canTest) return;
+    setStatus({ kind: "testing" });
+    try { setStatus({ kind: "ok", msg: await githubTest(url.trim(), token.trim()) }); }
+    catch (e) { setStatus({ kind: "err", msg: String(e) }); }
+  };
+
+  const inputStyle = { background: t.inputBg, color: t.text, border: `0.5px solid ${t.inputBorder}`, borderRadius: R - 3 } as const;
+  const hostLabel = (a: GithubAccount) => (a.url ? hostOf(a.url) : "github.com");
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1">
+        <span className="text-sm font-semibold" style={{ color: t.text }}>GitHub 集成</span>
+        <span className="text-[11px]" style={{ color: t.textFaint }}>
+          维护多套 GitHub 账号(公有版留空地址,企业版填实例根地址)。推送 / 建 PR 时按远程地址自动匹配;匹配到多个账号会弹窗让你选择,只有一个则直接使用。
+        </span>
+      </div>
+
+      <div className="flex flex-col gap-1.5">
+        {accounts.length === 0 && (
+          <div className="text-[11px] px-1 py-6 text-center" style={{ color: t.textFaint }}>还没有账号,在下方添加一个</div>
+        )}
+        {accounts.map((a) => (
+          <div key={a.id} className="group flex items-center gap-2.5 px-2.5 py-2"
+            style={{ borderRadius: R - 2, border: `0.5px solid ${t.border}` }}>
+            <div className="flex items-center justify-center rounded-full flex-shrink-0"
+              style={{ width: 26, height: 26, background: t.accentBg }}>
+              <Github size={13} style={{ color: t.accent }} />
+            </div>
+            <div className="flex flex-col min-w-0 flex-1">
+              <span className="text-xs font-medium truncate" style={{ color: t.text }}>{a.label || hostLabel(a)}</span>
+              <span className="text-[11px] font-mono truncate" style={{ color: t.textMuted }}>
+                {hostLabel(a)} · ••••{a.token.slice(-4)}
+              </span>
+            </div>
+            <button {...press(() => startEdit(a))}
+              className="text-[11px] px-1.5 py-1 cursor-pointer opacity-0 group-hover:opacity-100"
+              style={{ color: t.textMuted, borderRadius: R - 4 }}>编辑</button>
+            <button {...press(() => remove(a.id))} title="删除"
+              className="p-1 cursor-pointer opacity-0 group-hover:opacity-100"
+              style={{ color: t.textMuted, borderRadius: R - 4 }}>
+              <Trash2 size={13} />
+            </button>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex flex-col gap-2 p-3" style={{ background: t.inputBg + "80", borderRadius: R - 1, border: `0.5px solid ${t.border}` }}>
+        <span className="text-[11px] font-semibold" style={{ color: t.textMuted }}>{editingId ? "编辑账号" : "添加账号"}</span>
+        <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="名称 / 备注(如 work、personal)"
+          className="text-xs px-2.5 py-2 outline-none" style={inputStyle} />
+        <input value={url} onChange={(e) => { setUrl(e.target.value); setStatus({ kind: "idle" }); }}
+          placeholder="实例地址(公有版留空,企业版填 https://ghe.example.com)"
+          className="text-xs px-2.5 py-2 outline-none font-mono" style={inputStyle} />
+        <div className="flex items-center" style={{ ...inputStyle, paddingRight: 4 }}>
+          <input value={token} onChange={(e) => { setToken(e.target.value); setStatus({ kind: "idle" }); }}
+            type={showToken ? "text" : "password"} placeholder="访问令牌 ghp_… / github_pat_…"
+            className="flex-1 text-xs px-2.5 py-2 outline-none font-mono bg-transparent" style={{ color: t.text }} />
+          <button {...press(() => setShowToken((v) => !v))} className="p-1.5 cursor-pointer flex-shrink-0"
+            style={{ color: t.textMuted }} title={showToken ? "隐藏" : "显示"}>
+            {showToken ? <EyeOff size={13} /> : <Eye size={13} />}
+          </button>
+        </div>
+        <span className="text-[10px]" style={{ color: t.textFaint }}>推送需 repo 权限。令牌存储在本地(后续可迁移到系统钥匙串)。</span>
+        <div className="flex items-center gap-3 flex-wrap">
+          <button {...(canTest ? press(runTest) : {})} disabled={!canTest}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
+            style={{ background: t.inputBg, color: canTest ? t.text : t.textFaint,
+              border: `0.5px solid ${t.inputBorder}`, borderRadius: R - 3, cursor: canTest ? "pointer" : "not-allowed" }}>
+            <RefreshCw size={12} className={status.kind === "testing" ? "animate-spin" : undefined} />
+            检测连接
+          </button>
+          {status.kind === "ok" && (
+            <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.green }}>
+              <Check size={13} className="flex-shrink-0" /><span className="truncate">已连接：{status.msg}</span>
+            </span>
+          )}
+          {status.kind === "err" && (
+            <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.red }}>
+              <AlertTriangle size={13} className="flex-shrink-0" /><span className="truncate">{status.msg}</span>
+            </span>
+          )}
+          <div className="flex-1" />
+          {editingId && (
+            <button {...press(reset)} className="px-3 py-1.5 text-xs cursor-pointer"
+              style={{ color: t.textMuted, borderRadius: R - 3 }}>取消</button>
+          )}
+          <button {...(valid ? press(submit) : {})} disabled={!valid}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
+            style={{ background: valid ? t.accent : t.inputBg, color: valid ? "#fff" : t.textFaint,
+              borderRadius: R - 3, opacity: valid ? 1 : 0.7, cursor: valid ? "pointer" : "not-allowed" }}>
+            {!editingId && <UserPlus size={12} />}
+            {editingId ? "保存" : "添加"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Second-level pane: appearance (frosted-glass window) + in-app update check.
 function AppearanceSettings({ vibrancy, setVibrancy, paletteId, setPaletteId, themeMode, setThemeMode }: {
   vibrancy: boolean; setVibrancy: (v: boolean) => void;
@@ -3083,13 +3255,7 @@ function SettingsDialog({ identities, setIdentities, defaultId, setDefaultId, vi
                 hint="推送需 write_repository 权限;列项目/建 MR 需 api 权限。令牌存储在本地(后续可迁移到系统钥匙串)。"
                 test={gitlabTest} />
             )}
-            {section === "github" && (
-              <RemoteConnSettings storageKey="gitkit.github" title="GitHub 集成"
-                desc="公有 GitHub 留空地址即可;GitHub Enterprise 填写实例根地址。令牌用于推送认证与创建 PR。"
-                urlPlaceholder="https://github.com（企业版填 https://ghe.example.com）" tokenPlaceholder="ghp_… / github_pat_…"
-                hint="推送需 repo 权限。令牌存储在本地(后续可迁移到系统钥匙串)。"
-                test={githubTest} />
-            )}
+            {section === "github" && <GithubAccountsSettings />}
             {section === "appearance" && (
               <AppearanceSettings vibrancy={vibrancy} setVibrancy={setVibrancy}
                 paletteId={paletteId} setPaletteId={setPaletteId}
@@ -3633,11 +3799,13 @@ export default function App() {
   // that triggers the build CI. Keeps the dialog open if the name is rejected.
   const doCreateAndPushTag = async (name: string, message: string) => {
     if (!activeProject) return;
-    setTagBusy(true);
-    const tid = toast.loading(`正在创建并推送标签 ${name}…`);
     const p = activeProject.path;
     const originUrl = remotes.find((r) => r.name === "origin")?.url ?? remotes[0]?.url ?? "";
-    const token = pickRemoteToken(originUrl);
+    const resolved = await resolveRemoteToken(originUrl, "推送标签");
+    if (!resolved) return; // account picker cancelled — don't create the tag either
+    const token = resolved.token;
+    setTagBusy(true);
+    const tid = toast.loading(`正在创建并推送标签 ${name}…`);
     try {
       await createTag(p, name, message);
     } catch (e) {
@@ -3697,15 +3865,41 @@ export default function App() {
     } catch (e) { toast.error(`删除储藏失败：${e}`); }
   };
 
+  // GitHub multi-account picker. When a remote matches 2+ configured accounts,
+  // remote-auth actions (push/pull/fetch/tag/PR) prompt to choose one — no
+  // memory, every action re-asks. `chooseAccount` returns a promise the modal
+  // resolves; `resolveRemoteToken` wraps candidate selection + non-interactive
+  // fallback, returning null only when the user cancels the picker.
+  const [acctPicker, setAcctPicker] = useState<
+    { action: string; accounts: GithubAccount[]; resolve: (a: GithubAccount | null) => void } | null
+  >(null);
+  const chooseAccount = (accounts: GithubAccount[], action: string) =>
+    new Promise<GithubAccount | null>((resolve) => setAcctPicker({ action, accounts, resolve }));
+  const resolveRemoteToken = async (
+    remoteUrl: string,
+    action: string,
+  ): Promise<{ token?: string; account?: GithubAccount } | null> => {
+    const cands = githubCandidates(remoteUrl);
+    if (cands.length >= 2) {
+      const chosen = await chooseAccount(cands, action);
+      if (!chosen) return null; // user cancelled
+      return { token: chosen.token, account: chosen };
+    }
+    if (cands.length === 1) return { token: cands[0].token, account: cands[0] };
+    return { token: pickRemoteToken(remoteUrl) };
+  };
+
   // Fetch / pull / push. Each refreshes the repo afterwards (cache-busting reload).
   const runGitAction = async (kind: "fetch" | "pull" | "push") => {
     if (!activeProject || gitBusy) return;
     const p = activeProject.path;
     const verbs = { fetch: "获取", pull: "拉取", push: "推送" } as const;
+    const originUrl = remotes.find((r) => r.name === "origin")?.url ?? remotes[0]?.url ?? "";
+    const resolved = await resolveRemoteToken(originUrl, verbs[kind]);
+    if (!resolved) return; // account picker cancelled
+    const token = resolved.token;
     setGitBusy(kind);
     const tid = toast.loading(`正在${verbs[kind]}…`);
-    const originUrl = remotes.find((r) => r.name === "origin")?.url ?? remotes[0]?.url ?? "";
-    const token = pickRemoteToken(originUrl);
     try {
       if (kind === "fetch") await fetchAll(p, token);
       else if (kind === "pull") await pull(p, token);
@@ -3904,9 +4098,9 @@ export default function App() {
   const prInfo = (() => {
     const originUrl = remotes.find((r) => r.name === "origin")?.url ?? remotes[0]?.url ?? "";
     const host = hostOf(originUrl);
-    const gh = loadGithub(), gl = loadGitlab();
-    const isGithub = host === "github.com" || host.endsWith(".github.com") || (!!gh.url && host === hostOf(gh.url));
-    if (isGithub && gh.token) return { provider: "github" as const, instanceUrl: gh.url, token: gh.token, remoteUrl: originUrl, term: "拉取请求" };
+    // GitHub token/instance is resolved at submit time (may prompt among accounts).
+    if (githubCandidates(originUrl).length) return { provider: "github" as const, instanceUrl: "", token: "", remoteUrl: originUrl, term: "拉取请求" };
+    const gl = loadGitlab();
     if (gl.token && (!gl.url || host === hostOf(gl.url))) return { provider: "gitlab" as const, instanceUrl: gl.url, token: gl.token, remoteUrl: originUrl, term: "合并请求" };
     return null;
   })();
@@ -3917,11 +4111,20 @@ export default function App() {
   };
   const doCreatePR = async (source: string, target: string, title: string, description: string) => {
     if (!prInfo) return;
+    let instanceUrl = prInfo.instanceUrl;
+    let token = prInfo.token;
+    // GitHub: pick the account matching origin (prompts when several match).
+    if (prInfo.provider === "github") {
+      const resolved = await resolveRemoteToken(prInfo.remoteUrl, "创建拉取请求");
+      if (!resolved || !resolved.token) return; // cancelled, or no token configured
+      token = resolved.token;
+      instanceUrl = resolved.account?.url ?? "";
+    }
     const tid = toast.loading("正在创建…");
     try {
       const url = await createPullRequest({
-        provider: prInfo.provider, instanceUrl: prInfo.instanceUrl, remoteUrl: prInfo.remoteUrl,
-        token: prInfo.token, source, target, title, description,
+        provider: prInfo.provider, instanceUrl, remoteUrl: prInfo.remoteUrl,
+        token, source, target, title, description,
       });
       setPrOpen(false);
       toast.success(`已创建${prInfo.term},正在浏览器打开`, { id: tid, description: url });
@@ -4325,6 +4528,38 @@ export default function App() {
             defaultTarget={["main", "master", "dev", "develop"].find((n) => branches.some((b) => b.name === n))
               ?? branches.find((b) => b.name !== currentBranch)?.name ?? currentBranch}
             onCancel={() => setPrOpen(false)} onConfirm={doCreatePR} />
+        )}
+
+        {acctPicker && (
+          <Modal title={`选择 GitHub 账号 · ${acctPicker.action}`} Icon={Github}
+            onClose={() => { acctPicker.resolve(null); setAcctPicker(null); }} width={440}>
+            <span className="text-[11px]" style={{ color: theme.textFaint }}>
+              该远程匹配到多个 GitHub 账号,选择本次{acctPicker.action}使用的身份。
+            </span>
+            <div className="flex flex-col gap-1.5">
+              {acctPicker.accounts.map((a) => {
+                const host = a.url ? hostOf(a.url) : "github.com";
+                return (
+                  <button key={a.id}
+                    {...press(() => { acctPicker.resolve(a); setAcctPicker(null); })}
+                    className="flex items-center gap-2.5 px-3 py-2.5 text-left cursor-pointer transition-colors"
+                    style={{ borderRadius: R - 2, border: `0.5px solid ${theme.border}`, background: "transparent" }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = theme.rowHover)}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                    <div className="flex items-center justify-center rounded-full flex-shrink-0"
+                      style={{ width: 26, height: 26, background: theme.accentBg }}>
+                      <Github size={13} style={{ color: theme.accent }} />
+                    </div>
+                    <div className="flex flex-col min-w-0 flex-1">
+                      <span className="text-xs font-medium truncate" style={{ color: theme.text }}>{a.label || host}</span>
+                      <span className="text-[11px] font-mono truncate" style={{ color: theme.textMuted }}>{host} · ••••{a.token.slice(-4)}</span>
+                    </div>
+                    <ArrowRight size={14} className="flex-shrink-0" style={{ color: theme.textFaint }} />
+                  </button>
+                );
+              })}
+            </div>
+          </Modal>
         )}
 
         {confirmState && (
