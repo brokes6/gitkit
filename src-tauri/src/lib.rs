@@ -106,6 +106,8 @@ pub fn run() {
             git::gitlab_test,
             git::github_test,
             git::create_pull_request,
+            git::github_create_repo,
+            git::git_remote_add,
             set_vibrancy,
         ])
         .run(tauri::generate_context!())

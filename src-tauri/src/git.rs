@@ -352,9 +352,12 @@ pub struct StatusEntry {
 #[tauri::command]
 pub async fn git_status(path: String) -> Result<Vec<StatusEntry>, String> {
     run_blocking(move || {
+    // `-uall` lists every untracked file individually; without it git collapses a
+    // fully-untracked directory into a single `dir/` entry, which hides the files
+    // and breaks staging (update-index can't take a directory path).
     let out = run_git(
         &path,
-        &["-c", "core.quotepath=false", "status", "--porcelain"],
+        &["-c", "core.quotepath=false", "status", "--porcelain", "-uall"],
     )?;
     let mut res = Vec::new();
     for line in out.lines() {
@@ -1441,4 +1444,80 @@ pub async fn create_pull_request(
         let _ = std::process::Command::new("open").arg(&web_url).spawn();
     }
     Ok(web_url)
+}
+
+#[derive(Serialize)]
+pub struct GithubRepo {
+    pub clone_url: String,
+    pub html_url: String,
+    pub full_name: String,
+}
+
+/// Create a repository on GitHub / GitHub Enterprise under the token's account
+/// (`POST {api}/user/repos`) and return its URLs. Bootstraps a remote for a
+/// local-only repo; the caller then wires it as `origin` and pushes.
+#[tauri::command]
+pub async fn github_create_repo(
+    instance_url: String,
+    token: String,
+    name: String,
+    private: bool,
+    description: String,
+) -> Result<GithubRepo, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("仓库名称不能为空".into());
+    }
+    if token.trim().is_empty() {
+        return Err("请先配置访问令牌".into());
+    }
+    let endpoint = format!("{}/user/repos", github_api_base(&instance_url));
+    let body = serde_json::json!({
+        "name": name,
+        "private": private,
+        "description": description.trim(),
+        "auto_init": false,
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {}", token.trim()))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "GitKit")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败：{}", e))?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    if status.is_success() {
+        Ok(GithubRepo {
+            clone_url: v.get("clone_url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            html_url: v.get("html_url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            full_name: v.get("full_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        })
+    } else if status.as_u16() == 401 {
+        Err("认证失败：令牌无效或权限不足（需 repo 权限）".into())
+    } else {
+        let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("创建失败");
+        // 422 usually carries a more specific reason (e.g. name already exists).
+        let extra = v
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("message").and_then(|m| m.as_str()));
+        Err(match extra {
+            Some(x) => format!("GitHub：{}（{}）", msg, x),
+            None => format!("GitHub：{}", msg),
+        })
+    }
+}
+
+/// Add a remote (`git remote add <name> <url>`) to a local repo.
+#[tauri::command]
+pub async fn git_remote_add(path: String, name: String, url: String) -> Result<(), String> {
+    run_blocking(move || run_git(&path, &["remote", "add", &name, &url]).map(|_| ())).await
 }
