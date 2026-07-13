@@ -16,7 +16,7 @@ import {
   attributeBranches, computeGraph, hasChanges, checkoutBranch, stashPush, stashList, stashApply, stashDrop, stashFiles, stashFileDiff, cherryPick, cherryPickPreflight,
   createBranch, checkoutSync, commit as gitCommit, fetchAll, pull, push, gitlabTest, githubTest,
   createPullRequest, branchColor, setVibrancy, checkForUpdate, discardFile, discardAll,
-  checkDeps, mergePreview, loadTags, createTag, pushTag,
+  checkDeps, mergePreview, loadTags, createTag, pushTag, githubCreateRepo, gitRemoteAdd,
 } from "./git";
 import type { DepInfo, Tag } from "./git";
 
@@ -2297,6 +2297,76 @@ function ModalFooter({ onCancel, onConfirm, confirmLabel, disabled, busy }: {
 const dlgCtl = (t: ThemeColors, err = false): React.CSSProperties =>
   ({ background: t.inputBg, color: t.text, border: `0.5px solid ${err ? t.red + "88" : t.inputBorder}`, borderRadius: R - 2 });
 
+// ─── CreateRepoDialog (bootstrap a GitHub remote for a local-only repo) ──────
+
+function CreateRepoDialog({ accounts, defaultName, busy, onCancel, onConfirm }: {
+  accounts: GithubAccount[]; defaultName: string; busy: boolean;
+  onCancel: () => void;
+  onConfirm: (account: GithubAccount, name: string, isPrivate: boolean, description: string) => void;
+}) {
+  const t = useTheme();
+  const [accountId, setAccountId] = useState(accounts[0]?.id ?? "");
+  const [name, setName] = useState(defaultName);
+  const [isPrivate, setIsPrivate] = useState(true);
+  const [description, setDescription] = useState("");
+  const account = accounts.find((a) => a.id === accountId) ?? accounts[0];
+  const nameOk = /^[A-Za-z0-9._-]+$/.test(name.trim());
+  const canSubmit = !!account && nameOk && !busy;
+  const host = account && account.url ? hostOf(account.url) : "github.com";
+
+  const visBtn = (val: boolean, label: string, desc: string) => {
+    const active = isPrivate === val;
+    return (
+      <button {...press(() => setIsPrivate(val))}
+        className="flex-1 flex flex-col gap-0.5 px-3 py-2 text-left cursor-pointer"
+        style={{ borderRadius: R - 2, border: `0.5px solid ${active ? t.accent : t.inputBorder}`,
+          background: active ? t.accentBg : "transparent" }}>
+        <span className="text-xs font-medium" style={{ color: active ? t.accentFg : t.text }}>{label}</span>
+        <span className="text-[10px]" style={{ color: t.textFaint }}>{desc}</span>
+      </button>
+    );
+  };
+
+  return (
+    <Modal title="创建 GitHub 仓库并推送" Icon={Github} onClose={busy ? () => {} : onCancel} width={460}
+      footer={<ModalFooter onCancel={onCancel}
+        onConfirm={() => { if (canSubmit && account) onConfirm(account, name.trim(), isPrivate, description.trim()); }}
+        confirmLabel="创建并推送" disabled={!canSubmit} busy={busy} />}>
+      <span className="text-[11px]" style={{ color: t.textFaint }}>
+        该仓库还没有远程地址。将在 {host} 上创建一个新仓库,设为 origin 并推送当前分支。
+      </span>
+      {accounts.length > 1 && (
+        <Field label="GitHub 账号">
+          <select value={accountId} onChange={(e) => setAccountId(e.target.value)}
+            className="text-xs px-2.5 py-2 outline-none" style={dlgCtl(t)}>
+            {accounts.map((a) => (
+              <option key={a.id} value={a.id}>
+                {(a.label || (a.url ? hostOf(a.url) : "github.com"))} · ••••{a.token.slice(-4)}
+              </option>
+            ))}
+          </select>
+        </Field>
+      )}
+      <Field label="仓库名称">
+        <input value={name} onChange={(e) => setName(e.target.value)} autoFocus
+          placeholder="my-repo" className="text-xs px-2.5 py-2 outline-none font-mono"
+          style={dlgCtl(t, name.length > 0 && !nameOk)} />
+      </Field>
+      <Field label="可见性">
+        <div className="flex items-center gap-2">
+          {visBtn(true, "私有", "仅自己与协作者可见")}
+          {visBtn(false, "公开", "任何人可见")}
+        </div>
+      </Field>
+      <Field label="描述（可选）">
+        <input value={description} onChange={(e) => setDescription(e.target.value)}
+          placeholder="一句话说明这个仓库" className="text-xs px-2.5 py-2 outline-none"
+          style={dlgCtl(t)} />
+      </Field>
+    </Modal>
+  );
+}
+
 // ─── CreateBranchDialog ─────────────────────────────────────────────────────
 
 function CreateBranchDialog({ branches, defaultBase, onCancel, onConfirm }: {
@@ -3889,11 +3959,45 @@ export default function App() {
     return { token: pickRemoteToken(remoteUrl) };
   };
 
+  // Bootstrap a GitHub remote for a local-only repo: create the repo under a
+  // configured account, wire it as origin, then push the current branch.
+  const [createRepoOpen, setCreateRepoOpen] = useState(false);
+  const [createRepoBusy, setCreateRepoBusy] = useState(false);
+  const doCreateRepoAndPush = async (account: GithubAccount, name: string, isPrivate: boolean, description: string) => {
+    if (!activeProject) return;
+    const p = activeProject.path;
+    setCreateRepoBusy(true);
+    const tid = toast.loading(`正在创建仓库 ${name}…`);
+    try {
+      const repo = await githubCreateRepo(account.url, account.token, name, isPrivate, description);
+      toast.loading("仓库已创建,正在推送…", { id: tid });
+      await gitRemoteAdd(p, "origin", repo.cloneUrl);
+      await push(p, account.token);
+      realCache.current.delete(p);
+      setReloadTick((n) => n + 1);
+      setCreateRepoOpen(false);
+      toast.success("仓库已创建并推送", { id: tid, description: repo.htmlUrl });
+    } catch (e) {
+      // If the remote was added but the push failed (e.g. no commits yet), the
+      // repo now has an origin — a later push takes the normal path.
+      toast.error(`创建 / 推送失败：${e}`, { id: tid });
+    } finally {
+      setCreateRepoBusy(false);
+    }
+  };
+
   // Fetch / pull / push. Each refreshes the repo afterwards (cache-busting reload).
   const runGitAction = async (kind: "fetch" | "pull" | "push") => {
     if (!activeProject || gitBusy) return;
     const p = activeProject.path;
     const verbs = { fetch: "获取", pull: "拉取", push: "推送" } as const;
+    if (remotes.length === 0) {
+      // No remote yet: for a push with a GitHub account configured, offer to create
+      // the repo on GitHub and wire it up. Fetch/pull can't be bootstrapped this way.
+      if (kind === "push" && loadGithubAccounts().length > 0) { setCreateRepoOpen(true); return; }
+      toast.error(`没有配置远程仓库,无法${verbs[kind]}。可在设置中添加 GitHub 账号后重试,或先手动 git remote add origin <url>。`);
+      return;
+    }
     const originUrl = remotes.find((r) => r.name === "origin")?.url ?? remotes[0]?.url ?? "";
     const resolved = await resolveRemoteToken(originUrl, verbs[kind]);
     if (!resolved) return; // account picker cancelled
@@ -4466,6 +4570,13 @@ export default function App() {
             defaultBase={currentBranch || branches[0]?.name || ""}
             onCancel={() => setCreateBranchOpen(false)}
             onConfirm={doCreateBranch} />
+        )}
+
+        {createRepoOpen && activeProject && loadGithubAccounts().length > 0 && (
+          <CreateRepoDialog accounts={loadGithubAccounts()} defaultName={activeProject.name}
+            busy={createRepoBusy}
+            onCancel={() => { if (!createRepoBusy) setCreateRepoOpen(false); }}
+            onConfirm={doCreateRepoAndPush} />
         )}
 
         {tagDialogOpen && activeProject && (

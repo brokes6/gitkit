@@ -458,6 +458,23 @@ export async function push(path: string, token?: string): Promise<void> {
   await invoke("git_push", { path, token: token ?? null });
 }
 
+/** A repository created on GitHub, with the URLs needed to wire it up locally. */
+export interface GithubRepo { cloneUrl: string; htmlUrl: string; fullName: string }
+
+/** Create a repo under the token's GitHub account. `instanceUrl` is "" for public github.com. */
+export async function githubCreateRepo(
+  instanceUrl: string, token: string, name: string, isPrivate: boolean, description: string,
+): Promise<GithubRepo> {
+  const r = await invoke<{ clone_url: string; html_url: string; full_name: string }>("github_create_repo",
+    { instanceUrl, token, name, private: isPrivate, description });
+  return { cloneUrl: r.clone_url, htmlUrl: r.html_url, fullName: r.full_name };
+}
+
+/** Add a remote to a local repo (`git remote add <name> <url>`). */
+export async function gitRemoteAdd(path: string, name: string, url: string): Promise<void> {
+  await invoke("git_remote_add", { path, name, url });
+}
+
 /** A tag: name, the short hash it points at, its date and message subject. */
 export interface Tag {
   name: string;
