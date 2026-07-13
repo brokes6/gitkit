@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef, startTransition, useTransition, createContext, useContext } from "react";
 import { createPortal } from "react-dom";
 import { Toaster, toast } from "sonner";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   GitBranch, GitMerge, GitPullRequest, Upload, Download, RefreshCw,
   Layers, ChevronRight, Copy, Check, GitCommit, FileText,
   Moon, Sun, Monitor, Plus, Minus, X, FolderOpen, ArrowRight,
   Pin, EyeOff, Eye, Folder, AlertTriangle, Cloud, GitBranchPlus, ChevronLeft, LayoutGrid,
   Settings, UserPlus, Trash2, Star, Users, Github, Laptop, Sparkles, RotateCcw, TerminalSquare,
+  Tag as TagIcon, Square,
 } from "lucide-react";
 import {
   pickRepoFolder, openRepo, loadBranches, loadRemotes, loadHistory,
@@ -14,9 +16,9 @@ import {
   attributeBranches, computeGraph, hasChanges, checkoutBranch, stashPush, stashList, stashApply, stashDrop, stashFiles, stashFileDiff, cherryPick, cherryPickPreflight,
   createBranch, checkoutSync, commit as gitCommit, fetchAll, pull, push, gitlabTest, githubTest,
   createPullRequest, branchColor, setVibrancy, checkForUpdate, discardFile, discardAll,
-  checkDeps, mergePreview,
+  checkDeps, mergePreview, loadTags, createTag, pushTag,
 } from "./git";
-import type { DepInfo } from "./git";
+import type { DepInfo, Tag } from "./git";
 
 // ─── theme ────────────────────────────────────────────────────────────────────
 
@@ -569,6 +571,37 @@ const THEME_META: Record<ThemeMode, { Icon: typeof Moon; label: string }> = {
   system: { Icon: Monitor, label: "跟随系统" },
 };
 
+// Windows has no native overlay title bar, so we render our own controls there.
+// macOS keeps its native traffic lights (Overlay title bar) and skips these.
+const IS_WINDOWS = typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+
+// Minimize / maximize / close for the borderless Windows window.
+function WindowControls() {
+  const t = useTheme();
+  const win = getCurrentWindow();
+  const hover = (bg: string, fg: string) => ({
+    onMouseEnter: (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = bg; e.currentTarget.style.color = fg; },
+    onMouseLeave: (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = t.textMuted; },
+  });
+  const cls = "flex items-center justify-center flex-shrink-0 cursor-pointer transition-colors duration-100";
+  return (
+    <div className="flex items-stretch self-stretch flex-shrink-0" style={{ marginRight: -16, marginLeft: 6 }}>
+      <button title="最小化" onClick={() => { void win.minimize(); }} className={cls}
+        style={{ width: 44, color: t.textMuted }} {...hover(t.inputBg, t.text)}>
+        <Minus size={15} />
+      </button>
+      <button title="最大化 / 还原" onClick={() => { void win.toggleMaximize(); }} className={cls}
+        style={{ width: 44, color: t.textMuted }} {...hover(t.inputBg, t.text)}>
+        <Square size={11} />
+      </button>
+      <button title="关闭" onClick={() => { void win.close(); }} className={cls}
+        style={{ width: 44, color: t.textMuted }} {...hover("#e81123", "#fff")}>
+        <X size={16} />
+      </button>
+    </div>
+  );
+}
+
 function TitleBar({ projects, activeId, branch, themeMode, onThemeCycle, onSelectProject, onOpenNew, onOpenSettings }: {
   projects: Project[]; activeId: string; branch: string;
   themeMode: ThemeMode; onThemeCycle: () => void;
@@ -580,7 +613,7 @@ function TitleBar({ projects, activeId, branch, themeMode, onThemeCycle, onSelec
   const active = projects.find((p) => p.id === activeId) ?? projects[0];
   return (
     <div data-tauri-drag-region className="relative h-11 flex items-center pr-4 flex-shrink-0 select-none"
-      style={{ ...glassStyle(t), paddingLeft: 92, zIndex: menuOpen ? 50 : "auto" }}>
+      style={{ ...glassStyle(t), paddingLeft: IS_WINDOWS ? 14 : 92, zIndex: menuOpen ? 50 : "auto" }}>
       <div data-tauri-drag-region className="flex items-center gap-2 text-sm flex-1 min-w-0">
         {/* Project name → switcher */}
         <button onClick={() => setMenuOpen((v) => !v)}
@@ -617,6 +650,8 @@ function TitleBar({ projects, activeId, branch, themeMode, onThemeCycle, onSelec
         <Icon size={12} />
         <span>{label}</span>
       </button>
+
+      {IS_WINDOWS && <WindowControls />}
 
       {menuOpen && (
         <>
@@ -672,6 +707,7 @@ function ProjectTab({ project, isActive, isLast, onSelect, onClose }: {
   const [hovered, setHovered] = useState(false);
   return (
     <div className="relative flex items-center gap-2.5 px-4 cursor-pointer flex-shrink-0 select-none"
+      data-tab-active={isActive || undefined}
       onClick={onSelect}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
@@ -732,8 +768,22 @@ function ProjectTabBar({ projects, activeId, onSelect, onClose, onAdd }: {
   onSelect: (id: string) => void; onClose: (id: string) => void; onAdd: () => void;
 }) {
   const t = useTheme();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const lastId = projects[projects.length - 1]?.id;
+  // Keep the active tab in view when it changes. If it's the last one, scroll
+  // all the way to the end so the trailing "+" button is revealed too.
+  useEffect(() => {
+    const c = scrollRef.current;
+    if (!c) return;
+    if (activeId && activeId === lastId) {
+      c.scrollTo({ left: c.scrollWidth, behavior: "smooth" });
+    } else {
+      c.querySelector<HTMLElement>("[data-tab-active]")
+        ?.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" });
+    }
+  }, [activeId, lastId, projects.length]);
   return (
-    <div data-tauri-drag-region className="flex items-stretch flex-shrink-0 select-none"
+    <div ref={scrollRef} data-tauri-drag-region className="flex items-stretch flex-shrink-0 select-none"
       style={{ ...glassStyle(t), height: 42, overflowX: "auto", scrollbarWidth: "none" }}>
       <div style={{ width: "0.5px", background: t.glassBorder, flexShrink: 0 }} />
       {projects.map((proj, i) => (
@@ -757,13 +807,25 @@ function ProjectTabBar({ projects, activeId, onSelect, onClose, onAdd }: {
 
 // ─── ActionBar ────────────────────────────────────────────────────────────────
 
-function ActionBar({ onCreateBranch, onFetch, onPull, onPush, onCherryPick, onStash, onCreatePR, pushCount = 0, busy }: {
+function ActionBar({ onCreateBranch, onFetch, onPull, onPush, onCreateTag, onCherryPick, onStash, onCreatePR, pushCount = 0, busy }: {
   onCreateBranch?: () => void;
   onFetch?: () => void; onPull?: () => void; onPush?: () => void;
+  onCreateTag?: () => void;
   onCherryPick?: () => void; onStash?: () => void; onCreatePR?: () => void;
   pushCount?: number; busy?: null | "fetch" | "pull" | "push";
 }) {
   const t = useTheme();
+  // Hovering 推送 for >1s reveals a secondary menu (创建 Tag 并推送).
+  const [pushMenu, setPushMenu] = useState(false);
+  const pushTimer = useRef<number | null>(null);
+  const openPushTimer = () => {
+    if (pushTimer.current) clearTimeout(pushTimer.current);
+    pushTimer.current = window.setTimeout(() => setPushMenu(true), 1000);
+  };
+  const closePushMenu = () => {
+    if (pushTimer.current) { clearTimeout(pushTimer.current); pushTimer.current = null; }
+    setPushMenu(false);
+  };
   const actions = [
     { label: "获取",       icon: RefreshCw,      accent: false, badge: 0 },
     { label: "拉取",       icon: Download,       accent: false, badge: 0 },
@@ -793,31 +855,60 @@ function ActionBar({ onCreateBranch, onFetch, onPull, onPush, onCherryPick, onSt
 
   return (
     <div className="h-11 flex items-center px-3 gap-0.5 flex-shrink-0 select-none"
-      style={glassStyle(t)}>
-      {actions.map((a) => (
-        <button key={a.label} onClick={() => handleClick(a.label)}
-          disabled={busyLabel === a.label}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-all duration-150 cursor-pointer"
-          style={{ color: a.accent ? t.accent : t.textMuted, borderRadius: R - 2 }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.background = a.accent ? t.accentBg : t.inputBg;
-            e.currentTarget.style.color = a.accent ? t.accentFg : t.text;
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.background = "transparent";
-            e.currentTarget.style.color = a.accent ? t.accent : t.textMuted;
-          }}>
-          <a.icon size={12} className={busyLabel === a.label ? "animate-spin" : undefined} />
-          <span>{a.label}</span>
-          {a.badge > 0 && (
-            <span className="flex items-center justify-center rounded-full text-[11px] font-bold ml-0.5"
-              style={{ width: 15, height: 15, background: t.accent, color: "#fff",
-                boxShadow: `0 0 8px ${t.accent}66` }}>
-              {a.badge}
-            </span>
-          )}
-        </button>
-      ))}
+      style={{ ...glassStyle(t), position: "relative", zIndex: 30 }}>
+      {actions.map((a) => {
+        const btn = (
+          <button key={a.label} onClick={() => handleClick(a.label)}
+            disabled={busyLabel === a.label}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-all duration-150 cursor-pointer"
+            style={{ color: a.accent ? t.accent : t.textMuted, borderRadius: R - 2 }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = a.accent ? t.accentBg : t.inputBg;
+              e.currentTarget.style.color = a.accent ? t.accentFg : t.text;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = "transparent";
+              e.currentTarget.style.color = a.accent ? t.accent : t.textMuted;
+            }}>
+            <a.icon size={12} className={busyLabel === a.label ? "animate-spin" : undefined} />
+            <span>{a.label}</span>
+            {a.badge > 0 && (
+              <span className="flex items-center justify-center rounded-full text-[11px] font-bold ml-0.5"
+                style={{ width: 15, height: 15, background: t.accent, color: "#fff",
+                  boxShadow: `0 0 8px ${t.accent}66` }}>
+                {a.badge}
+              </span>
+            )}
+          </button>
+        );
+        // 推送 gets a hover-revealed secondary menu for tag-and-push.
+        if (a.label === "推送" && onCreateTag) {
+          return (
+            <div key={a.label} className="relative"
+              onMouseEnter={openPushTimer} onMouseLeave={closePushMenu}>
+              {btn}
+              {pushMenu && (
+                // paddingTop bridges the 4px gap so moving button→menu never
+                // leaves the hover area (the gap is a descendant, not open space).
+                <div className="absolute left-0 top-full" style={{ paddingTop: 4, zIndex: 80 }}>
+                  <div className="py-1 gk-modal-in"
+                    style={{ minWidth: 168, background: t.dialogBg, border: `0.5px solid ${t.glassBorder}`,
+                      borderRadius: R, boxShadow: t.shadowWindow }}>
+                    <button onClick={() => { closePushMenu(); onCreateTag(); }}
+                      className="flex items-center gap-2 w-full px-3 py-1.5 text-xs font-medium text-left cursor-pointer"
+                      style={{ color: t.textMuted }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = t.inputBg; e.currentTarget.style.color = t.text; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = t.textMuted; }}>
+                      <TagIcon size={12} /> 创建 Tag 并推送
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        }
+        return btn;
+      })}
     </div>
   );
 }
@@ -2201,6 +2292,68 @@ function CreateBranchDialog({ branches, defaultBase, onCancel, onConfirm }: {
   );
 }
 
+// ─── TagDialog ───────────────────────────────────────────────────────────────
+
+// Create a tag on the current branch's HEAD and push it to origin — the
+// release flow that drives CI. Shows existing tags for reference.
+function TagDialog({ path, currentBranch, busy, onCancel, onConfirm }: {
+  path: string; currentBranch: string; busy: boolean;
+  onCancel: () => void; onConfirm: (name: string, message: string) => void;
+}) {
+  const t = useTheme();
+  const [tags, setTags] = useState<Tag[] | null>(null);
+  const [name, setName] = useState("");
+  const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    loadTags(path).then((ts) => { if (alive) setTags(ts); }).catch(() => { if (alive) setTags([]); });
+    return () => { alive = false; };
+  }, [path]);
+
+  const trimmed = name.trim();
+  const exists = (tags ?? []).some((tg) => tg.name === trimmed);
+  const valid = trimmed.length > 0 && !exists && !/\s/.test(trimmed) && !busy;
+  const submit = () => { if (valid) onConfirm(trimmed, message.trim()); };
+
+  return (
+    <Modal title="创建 Tag 并推送" Icon={TagIcon} onClose={onCancel} width={480}
+      footer={<ModalFooter onCancel={onCancel} onConfirm={submit} confirmLabel="创建并推送" disabled={!valid} busy={busy} />}>
+      <div className="flex flex-col gap-1.5">
+        <span className="text-[11px] font-medium" style={{ color: t.textMuted }}>已有标签</span>
+        <div className="flex flex-col max-h-40 overflow-y-auto"
+          style={{ border: `0.5px solid ${t.inputBorder}`, borderRadius: R - 2, background: t.inputBg }}>
+          {tags === null ? (
+            <div className="px-3 py-2 text-[11px]" style={{ color: t.textFaint }}>加载中…</div>
+          ) : tags.length === 0 ? (
+            <div className="px-3 py-2 text-[11px]" style={{ color: t.textFaint }}>还没有任何标签</div>
+          ) : tags.map((tg) => (
+            <div key={tg.name} className="flex items-center gap-2 px-3 py-1.5">
+              <TagIcon size={11} className="flex-shrink-0" style={{ color: t.accent }} />
+              <span className="text-xs font-mono font-medium" style={{ color: t.text }}>{tg.name}</span>
+              <span className="text-[11px] font-mono" style={{ color: t.textFaint }}>{tg.target}</span>
+              <span className="text-[11px] flex-1 text-right" style={{ color: t.textFaint }}>{tg.date}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <Field label={`新标签名（打在 ${currentBranch || "当前分支"} 的最新提交上）`}>
+        <input autoFocus value={name} onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+          placeholder="v0.2.0"
+          className="text-xs px-2.5 py-2 outline-none font-mono w-full" style={dlgCtl(t, exists)} />
+        {exists && <span className="text-[11px]" style={{ color: t.red }}>标签 {trimmed} 已存在</span>}
+      </Field>
+      <Field label="说明（可选，填了即带注释标签）">
+        <input value={message} onChange={(e) => setMessage(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+          placeholder="Release v0.2.0"
+          className="text-xs px-2.5 py-2 outline-none w-full" style={dlgCtl(t)} />
+      </Field>
+    </Modal>
+  );
+}
+
 // ─── CherryPickDialog ────────────────────────────────────────────────────────
 
 function CherryPickDialog({ commit, branches, currentBranch, onCancel, onConfirm }: {
@@ -3093,6 +3246,8 @@ export default function App() {
   const [cherryTarget, setCherryTarget] = useState<Commit | null>(null);
   const [cherryConflict, setCherryConflict] = useState<{ commit: Commit; target: string; files: string[] } | null>(null);
   const [createBranchOpen, setCreateBranchOpen] = useState(false);
+  const [tagDialogOpen, setTagDialogOpen] = useState(false);
+  const [tagBusy, setTagBusy] = useState(false);
   const [confirmState, setConfirmState] = useState<null | {
     title: string; message: string; confirmLabel: string; onConfirm: () => Promise<void>;
   }>(null);
@@ -3474,6 +3629,35 @@ export default function App() {
     } catch (e) { toast.error(`创建分支失败：${e}`); }
   };
 
+  // Create a tag on the current HEAD and push it to origin — the release flow
+  // that triggers the build CI. Keeps the dialog open if the name is rejected.
+  const doCreateAndPushTag = async (name: string, message: string) => {
+    if (!activeProject) return;
+    setTagBusy(true);
+    const tid = toast.loading(`正在创建并推送标签 ${name}…`);
+    const p = activeProject.path;
+    const originUrl = remotes.find((r) => r.name === "origin")?.url ?? remotes[0]?.url ?? "";
+    const token = pickRemoteToken(originUrl);
+    try {
+      await createTag(p, name, message);
+    } catch (e) {
+      toast.error(`创建标签失败：${e}`, { id: tid });
+      setTagBusy(false);
+      return;
+    }
+    realCache.current.delete(p);
+    setReloadTick((n) => n + 1);
+    try {
+      await pushTag(p, name, token);
+      toast.success(`标签 ${name} 已创建并推送`, { id: tid });
+    } catch (e) {
+      toast.error(`标签 ${name} 已创建，但推送失败：${e}`, { id: tid });
+    } finally {
+      setTagBusy(false);
+      setTagDialogOpen(false);
+    }
+  };
+
   // ── stash: save working changes, then apply / drop saved entries ──
   const doStash = async () => {
     if (!activeProject || gitBusy) return;
@@ -3816,6 +4000,7 @@ export default function App() {
             onFetch={activeProject ? () => runGitAction("fetch") : undefined}
             onPull={activeProject ? () => runGitAction("pull") : undefined}
             onPush={activeProject ? () => runGitAction("push") : undefined}
+            onCreateTag={activeProject ? () => setTagDialogOpen(true) : undefined}
             onCherryPick={activeProject ? requestCherryPickActive : undefined}
             onStash={activeProject ? doStash : undefined}
             onCreatePR={activeProject ? requestCreatePR : undefined}
@@ -4078,6 +4263,13 @@ export default function App() {
             defaultBase={currentBranch || branches[0]?.name || ""}
             onCancel={() => setCreateBranchOpen(false)}
             onConfirm={doCreateBranch} />
+        )}
+
+        {tagDialogOpen && activeProject && (
+          <TagDialog path={activeProject.path} currentBranch={currentBranch}
+            busy={tagBusy}
+            onCancel={() => { if (!tagBusy) setTagDialogOpen(false); }}
+            onConfirm={doCreateAndPushTag} />
         )}
 
         {checkoutTarget && (

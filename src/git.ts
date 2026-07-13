@@ -458,6 +458,28 @@ export async function push(path: string, token?: string): Promise<void> {
   await invoke("git_push", { path, token: token ?? null });
 }
 
+/** A tag: name, the short hash it points at, its date and message subject. */
+export interface Tag {
+  name: string;
+  target: string;
+  date: string;
+  subject: string;
+}
+
+export async function loadTags(path: string): Promise<Tag[]> {
+  return await invoke<Tag[]>("git_tags", { path });
+}
+
+/** Create a tag on HEAD. Non-empty `message` → annotated tag; empty → lightweight. */
+export async function createTag(path: string, name: string, message = ""): Promise<void> {
+  await invoke("git_create_tag", { path, name, message });
+}
+
+/** Push a single tag to origin. */
+export async function pushTag(path: string, name: string, token?: string): Promise<void> {
+  await invoke("git_push_tag", { path, name, token: token ?? null });
+}
+
 /** Test a self-hosted GitLab connection; resolves to "name (@login)" or throws. */
 export async function gitlabTest(url: string, token: string): Promise<string> {
   return invoke<string>("gitlab_test", { url, token });
