@@ -33,6 +33,7 @@ fn set_vibrancy(window: tauri::WebviewWindow, enabled: bool) -> Result<(), Strin
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(git::WatchState::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Desktop-only plugins: window-state remembers window geometry
@@ -108,6 +109,9 @@ pub fn run() {
             git::create_pull_request,
             git::github_create_repo,
             git::git_remote_add,
+            git::git_clone,
+            git::start_watch,
+            git::stop_watch,
             set_vibrancy,
         ])
         .run(tauri::generate_context!())

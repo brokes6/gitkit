@@ -1,8 +1,12 @@
 // GitKit — Git backend. Shells out to the system `git` so that the user's
 // existing SSH keys, credentials and hooks are reused as-is.
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::Mutex;
+use tauri::Emitter;
 
 /// macOS GUI apps (launched from Finder/Dock) inherit a minimal PATH — usually
 /// just `/usr/bin:/bin:/usr/sbin:/sbin` — that omits Homebrew and other common
@@ -1543,4 +1547,227 @@ pub async fn github_create_repo(
 #[tauri::command]
 pub async fn git_remote_add(path: String, name: String, url: String) -> Result<(), String> {
     run_blocking(move || run_git(&path, &["remote", "add", &name, &url]).map(|_| ())).await
+}
+
+/// One streamed progress update from a running `git clone`, pushed to the
+/// frontend over a channel. `percent` is `None` for lines that carry no
+/// percentage (e.g. "Cloning into …", "remote: Enumerating objects: 1234").
+#[derive(Clone, Serialize)]
+pub struct CloneProgress {
+    pub phase: String,        // short Chinese label for the current step
+    pub percent: Option<u32>, // 0..=100 within the current step
+    pub raw: String,          // the raw git line, for a detail readout
+}
+
+/// The directory name `git clone` would create for a URL: the last path segment
+/// with a trailing ".git" stripped. Handles https ("https://host/group/repo.git")
+/// and scp-style ssh ("git@host:group/repo.git"); falls back to "repo".
+fn repo_name_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let last = trimmed.rsplit(|c| c == '/' || c == ':').next().unwrap_or("");
+    let name = last.strip_suffix(".git").unwrap_or(last).trim();
+    if name.is_empty() {
+        "repo".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Map a `git clone --progress` line to a short Chinese phase label.
+fn clone_phase_label(line: &str) -> String {
+    let label = if line.contains("Receiving objects") {
+        "接收对象"
+    } else if line.contains("Resolving deltas") {
+        "处理增量"
+    } else if line.contains("Compressing objects") {
+        "压缩对象"
+    } else if line.contains("Counting objects") {
+        "统计对象"
+    } else if line.contains("Enumerating objects") {
+        "枚举对象"
+    } else if line.contains("Updating files") || line.contains("Checking out files") {
+        "检出文件"
+    } else if line.starts_with("Cloning") {
+        "准备克隆"
+    } else {
+        "克隆中"
+    };
+    label.to_string()
+}
+
+/// Extract the first "NN%" percentage from a git progress line, if present.
+fn parse_clone_percent(line: &str) -> Option<u32> {
+    let bytes = line.as_bytes();
+    let pct = line.find('%')?;
+    let mut start = pct;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    if start == pct {
+        return None;
+    }
+    line[start..pct].parse::<u32>().ok().map(|p| p.min(100))
+}
+
+/// Clone `url` into a NEW subdirectory of `dest` (the parent folder the user
+/// picked), streaming git's progress to the frontend via the `on_progress`
+/// channel. Returns the absolute path of the cloned repository on success.
+///
+/// `token` (optional) is fed to HTTP(S) auth as `oauth2:<token>` via a one-shot
+/// credential helper — the same mechanism as fetch/pull/push; SSH URLs use the
+/// user's existing keys. `GIT_TERMINAL_PROMPT=0` makes auth failures fail fast
+/// instead of hanging on an interactive prompt.
+#[tauri::command]
+pub async fn git_clone(
+    url: String,
+    dest: String,
+    token: Option<String>,
+    on_progress: tauri::ipc::Channel<CloneProgress>,
+) -> Result<String, String> {
+    run_blocking(move || {
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return Err("请填写仓库地址".into());
+        }
+        let parent = std::path::Path::new(dest.trim());
+        if dest.trim().is_empty() || !parent.is_dir() {
+            return Err("请选择一个有效的目标文件夹".into());
+        }
+        let target = parent.join(repo_name_from_url(&url));
+        if target.exists() {
+            return Err(format!("目标已存在，请换个位置或先删除：{}", target.display()));
+        }
+        let target_str = target.to_string_lossy().to_string();
+
+        let mut cmd = command("git");
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cmd.env("PATH", augmented_path());
+        if let Some(tok) = token.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            cmd.env("GITKIT_GL_TOKEN", tok);
+            cmd.arg("-c").arg("credential.helper=");
+            cmd.arg("-c").arg(
+                "credential.helper=!f() { echo username=oauth2; echo \"password=$GITKIT_GL_TOKEN\"; }; f",
+            );
+        }
+        cmd.args(["clone", "--progress", &url, &target_str]);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| format!("无法执行 git：{e}"))?;
+        let stderr = child.stderr.take().ok_or("无法读取 git 输出")?;
+        let mut reader = std::io::BufReader::new(stderr);
+
+        let _ = on_progress.send(CloneProgress {
+            phase: "准备克隆".into(),
+            percent: None,
+            raw: format!("克隆 {url}"),
+        });
+
+        // git emits progress with '\r' (in-place refresh) and '\n' (new line), so
+        // split on either. Read a byte at a time — the BufReader buffers the actual
+        // syscalls, so this isn't a per-byte read on the pipe.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        let mut tail: Vec<String> = Vec::new(); // recent lines, for an error message
+        loop {
+            match std::io::Read::read(&mut reader, &mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let c = byte[0];
+                    if c == b'\r' || c == b'\n' {
+                        if !buf.is_empty() {
+                            let line = String::from_utf8_lossy(&buf).trim().to_string();
+                            buf.clear();
+                            if !line.is_empty() {
+                                let _ = on_progress.send(CloneProgress {
+                                    phase: clone_phase_label(&line),
+                                    percent: parse_clone_percent(&line),
+                                    raw: line.clone(),
+                                });
+                                tail.push(line);
+                                if tail.len() > 10 {
+                                    tail.remove(0);
+                                }
+                            }
+                        }
+                    } else {
+                        buf.push(c);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let status = child.wait().map_err(|e| format!("git 执行失败：{e}"))?;
+        if !status.success() {
+            // Prefer a fatal/error line; otherwise the last thing git printed.
+            let msg = tail
+                .iter()
+                .rev()
+                .find(|l| l.contains("fatal") || l.contains("error"))
+                .cloned()
+                .or_else(|| tail.last().cloned())
+                .unwrap_or_else(|| "克隆失败".into());
+            return Err(msg);
+        }
+
+        let _ = on_progress.send(CloneProgress {
+            phase: "完成".into(),
+            percent: Some(100),
+            raw: "克隆完成".into(),
+        });
+        Ok(target_str)
+    })
+    .await
+}
+
+/// Live filesystem watchers, one per watched repo path. Kept in Tauri managed
+/// state so the OS watch stays alive until `stop_watch` drops it. Replaces the
+/// old 3-second `git status` polling: edits show up as soon as the OS reports
+/// them (tens of ms) instead of on the next poll tick.
+#[derive(Default)]
+pub struct WatchState(pub Mutex<HashMap<String, RecommendedWatcher>>);
+
+/// True when a path sits inside a `.git` directory. Used to drop git-internal
+/// churn (lock files, and the index rewrite that a plain `git status` itself can
+/// trigger) so watching doesn't feed back into an endless reload loop.
+fn path_in_git(p: &std::path::Path) -> bool {
+    p.components().any(|c| c.as_os_str() == ".git")
+}
+
+/// Start watching `path` recursively. Emits `working-tree-changed` (payload = the
+/// repo path) whenever a file OUTSIDE `.git/` changes. Idempotent — watching an
+/// already-watched repo is a no-op. The watcher lives in `WatchState` until
+/// `stop_watch` removes (and thus drops) it.
+#[tauri::command]
+pub fn start_watch(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, WatchState>,
+    path: String,
+) -> Result<(), String> {
+    let mut map = state.0.lock().map_err(|e| e.to_string())?;
+    if map.contains_key(&path) {
+        return Ok(());
+    }
+    let repo = path.clone();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = res {
+            if ev.paths.iter().any(|p| !path_in_git(p)) {
+                let _ = app.emit("working-tree-changed", &repo);
+            }
+        }
+    })
+    .map_err(|e| format!("无法创建文件监听：{e}"))?;
+    watcher
+        .watch(std::path::Path::new(&path), RecursiveMode::Recursive)
+        .map_err(|e| format!("无法监听目录：{e}"))?;
+    map.insert(path, watcher);
+    Ok(())
+}
+
+/// Stop watching `path` (drops the watcher, releasing the OS watch).
+#[tauri::command]
+pub fn stop_watch(state: tauri::State<'_, WatchState>, path: String) -> Result<(), String> {
+    state.0.lock().map_err(|e| e.to_string())?.remove(&path);
+    Ok(())
 }

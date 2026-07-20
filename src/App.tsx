@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, startTransition, useTransition, createCont
 import { createPortal } from "react-dom";
 import { Toaster, toast } from "sonner";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import {
   GitBranch, GitMerge, GitPullRequest, Upload, Download, RefreshCw,
   Layers, ChevronRight, Copy, Check, GitCommit, FileText,
@@ -17,8 +18,9 @@ import {
   createBranch, checkoutSync, commit as gitCommit, fetchAll, pull, push, gitlabTest, githubTest,
   createPullRequest, branchColor, setVibrancy, checkForUpdate, discardFile, discardAll,
   checkDeps, mergePreview, loadTags, createTag, pushTag, githubCreateRepo, gitRemoteAdd,
+  cloneRepo, pickCloneParent, repoNameFromUrl, startWatch, stopWatch,
 } from "./git";
-import type { DepInfo, Tag } from "./git";
+import type { DepInfo, Tag, RepoInfo, CloneProgress } from "./git";
 
 // ─── theme ────────────────────────────────────────────────────────────────────
 
@@ -602,10 +604,10 @@ function WindowControls() {
   );
 }
 
-function TitleBar({ projects, activeId, branch, themeMode, onThemeCycle, onSelectProject, onOpenNew, onOpenSettings }: {
+function TitleBar({ projects, activeId, branch, themeMode, onThemeCycle, onSelectProject, onOpenNew, onCloneNew, onOpenSettings }: {
   projects: Project[]; activeId: string; branch: string;
   themeMode: ThemeMode; onThemeCycle: () => void;
-  onSelectProject: (id: string) => void; onOpenNew: () => void; onOpenSettings: () => void;
+  onSelectProject: (id: string) => void; onOpenNew: () => void; onCloneNew: () => void; onOpenSettings: () => void;
 }) {
   const t = useTheme();
   const { Icon, label } = THEME_META[themeMode];
@@ -690,6 +692,14 @@ function TitleBar({ projects, activeId, branch, themeMode, onThemeCycle, onSelec
               onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}>
               <FolderOpen size={14} />
               <span className="text-xs font-medium">打开新项目…</span>
+            </button>
+            <button onClick={() => { setMenuOpen(false); onCloneNew(); }}
+              className="w-full flex items-center gap-2.5 px-2 py-2 text-left cursor-pointer"
+              style={{ borderRadius: R - 3, color: t.accent }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = t.accentBg; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}>
+              <Cloud size={14} />
+              <span className="text-xs font-medium">克隆仓库…</span>
             </button>
           </div>
         </>
@@ -807,7 +817,8 @@ function ProjectTabBar({ projects, activeId, onSelect, onClose, onAdd }: {
 
 // ─── ActionBar ────────────────────────────────────────────────────────────────
 
-function ActionBar({ onCreateBranch, onFetch, onPull, onPush, onCreateTag, onCherryPick, onStash, onCreatePR, pushCount = 0, busy }: {
+function ActionBar({ onClone, onCreateBranch, onFetch, onPull, onPush, onCreateTag, onCherryPick, onStash, onCreatePR, pushCount = 0, busy }: {
+  onClone?: () => void;
   onCreateBranch?: () => void;
   onFetch?: () => void; onPull?: () => void; onPush?: () => void;
   onCreateTag?: () => void;
@@ -827,6 +838,7 @@ function ActionBar({ onCreateBranch, onFetch, onPull, onPush, onCreateTag, onChe
     setPushMenu(false);
   };
   const actions = [
+    { label: "克隆",       icon: Cloud,          accent: false, badge: 0 },
     { label: "获取",       icon: RefreshCw,      accent: false, badge: 0 },
     { label: "拉取",       icon: Download,       accent: false, badge: 0 },
     { label: "推送",       icon: Upload,         accent: false, badge: pushCount },
@@ -838,6 +850,7 @@ function ActionBar({ onCreateBranch, onFetch, onPull, onPush, onCreateTag, onChe
   ] as const;
 
   const handleClick = (label: string) => {
+    if (label === "克隆") { onClone?.(); return; }
     if (label === "获取") { onFetch?.(); return; }
     if (label === "拉取") { onPull?.(); return; }
     if (label === "推送") { onPush?.(); return; }
@@ -932,7 +945,7 @@ function SidebarSection({ label, open, onToggle }: { label: string; open: boolea
 
 function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidden, setHidden,
   pinned, setPinned, collapsed, setCollapsed,
-  onFocus, onShowAll, onHoverBranch, onCheckout, onStashClick, onStashApply, onStashDrop, onStashContext, selectedStashIndex }: {
+  onFocus, onShowAll, onHoverBranch, onCheckout, onSyncRemote, onRemoteContext, onStashClick, onStashApply, onStashDrop, onStashContext, selectedStashIndex }: {
   branches: Branch[]; remotes: Remote[]; stashes: Stash[];
   currentBranch: string; focusBranch: string | null;
   hidden: string[]; setHidden: React.Dispatch<React.SetStateAction<string[]>>;
@@ -941,6 +954,8 @@ function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidde
   onFocus: (name: string) => void; onShowAll: () => void;
   onHoverBranch: (name: string | null) => void;
   onCheckout?: (name: string) => void;
+  onSyncRemote?: (remoteName: string, leaf: string) => void;
+  onRemoteContext?: (e: React.MouseEvent, remoteName: string, leaf: string) => void;
   onStashClick?: (s: Stash) => void;
   onStashApply?: (index: number) => void; onStashDrop?: (index: number) => void;
   onStashContext?: (e: React.MouseEvent, s: Stash) => void;
@@ -951,12 +966,16 @@ function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidde
   const [stashesOpen,  setStashesOpen]  = useState(true);
   const [remotesOpen,  setRemotesOpen]  = useState(false);
   const [openRemotes,  setOpenRemotes]  = useState<string[]>([]);
+  // Remote folders default to COLLAPSED, so this tracks the ones expanded (empty
+  // ⇒ all collapsed) — the inverse of `collapsed`, which local folders use.
+  const [openRemoteFolders, setOpenRemoteFolders] = useState<string[]>([]);
   const [showHidden, setShowHidden] = useState(false);
 
   const togglePin  = (n: string) => setPinned((p) => p.includes(n) ? p.filter((x) => x !== n) : [...p, n]);
   const toggleHide = (n: string) => setHidden((p) => p.includes(n) ? p.filter((x) => x !== n) : [...p, n]);
   const toggleRemote = (n: string) => setOpenRemotes((p) => p.includes(n) ? p.filter((x) => x !== n) : [...p, n]);
   const toggleFolder = (f: string) => setCollapsed((p) => p.includes(f) ? p.filter((x) => x !== f) : [...p, f]);
+  const toggleRemoteFolder = (k: string) => setOpenRemoteFolders((p) => p.includes(k) ? p.filter((x) => x !== k) : [...p, k]);
 
   const itemStyle = (active: boolean): React.CSSProperties => ({
     borderRadius: R - 2,
@@ -1005,6 +1024,32 @@ function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidde
           {b.ahead  > 0 && <span className="text-[11px]" style={{ color: t.green + "cc" }}>↑{b.ahead}</span>}
           {b.behind > 0 && <span className="text-[11px]" style={{ color: t.amber + "cc" }}>↓{b.behind}</span>}
         </div>
+      </div>
+    );
+  };
+
+  // One remote-branch leaf (远程 → origin → …). `label` is what's shown (the last
+  // path segment inside a folder, or the whole leaf at the root); `leaf` is the
+  // full branch name under the remote used for actions. `pad` sets the indent so
+  // folder children sit deeper than roots.
+  const renderRemoteLeaf = (remoteName: string, leaf: string, label: string, pad: number) => {
+    const hasLocal = branches.some((b) => b.name === leaf);
+    const isCurrent = leaf === currentBranch;
+    return (
+      <div key={`${remoteName}/${leaf}`}
+        onDoubleClick={() => onSyncRemote?.(remoteName, leaf)}
+        onContextMenu={(e) => onRemoteContext?.(e, remoteName, leaf)}
+        className="flex items-center gap-2 pr-2 py-1 cursor-pointer select-none"
+        style={{ paddingLeft: pad, borderRadius: R - 2, margin: "0 8px 0 0",
+          background: isCurrent ? t.rowCurrent : "transparent", transition: "background 0.12s" }}
+        title={hasLocal ? `双击切换到本地分支 ${leaf}` : `双击将 ${remoteName}/${leaf} 同步到本地并检出`}
+        onMouseEnter={(e) => { if (!isCurrent) e.currentTarget.style.background = t.rowHover; }}
+        onMouseLeave={(e) => { if (!isCurrent) e.currentTarget.style.background = "transparent"; }}>
+        <GitBranch size={10} className="flex-shrink-0" style={{ color: isCurrent ? t.accent : t.textFaint }} />
+        <span className="text-[11px] truncate flex-1" style={{ color: isCurrent ? t.accentFg : t.textMuted }}>{label}</span>
+        {hasLocal
+          ? <Laptop size={10} className="flex-shrink-0" style={{ color: t.textFaint }} />
+          : <Download size={10} className="flex-shrink-0" style={{ color: t.textFaint }} />}
       </div>
     );
   };
@@ -1134,13 +1179,45 @@ function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidde
                     <span className="text-xs font-medium flex-1 truncate text-left">{r.name}</span>
                     <span className="text-[11px] flex-shrink-0" style={{ color: t.textFaint }}>{r.branches.length}</span>
                   </div>
-                  {open && r.branches.map((leaf) => (
-                    <div key={leaf} className="flex items-center gap-2 pr-2 py-1"
-                      style={{ paddingLeft: 40 }}>
-                      <GitBranch size={10} className="flex-shrink-0" style={{ color: t.textFaint }} />
-                      <span className="text-[11px] truncate" style={{ color: t.textMuted }}>{leaf}</span>
-                    </div>
-                  ))}
+                  {open && (() => {
+                    // Group this remote's branches into folders by the first path
+                    // segment (feat/master → "feat"), same as the local tree. Folder
+                    // collapse state is namespaced by remote ("origin/feat") so it's
+                    // independent of a same-named local folder.
+                    const rootLeaves = r.branches.filter((leaf) => !leaf.includes("/"));
+                    const folders = new Map<string, string[]>();
+                    r.branches.filter((leaf) => leaf.includes("/")).forEach((leaf) => {
+                      const f = leaf.slice(0, leaf.indexOf("/"));
+                      if (!folders.has(f)) folders.set(f, []);
+                      folders.get(f)!.push(leaf);
+                    });
+                    return (
+                      <>
+                        {rootLeaves.map((leaf) => renderRemoteLeaf(r.name, leaf, leaf, 40))}
+                        {Array.from(folders.keys()).sort().map((folder) => {
+                          const key = `${r.name}/${folder}`;
+                          const isCol = !openRemoteFolders.includes(key); // default collapsed
+                          const list = folders.get(folder)!;
+                          return (
+                            <div key={key}>
+                              <div onClick={() => toggleRemoteFolder(key)}
+                                className="flex items-center gap-1.5 px-3 cursor-pointer"
+                                style={{ color: t.textSec, height: 28, paddingLeft: 40 }}
+                                onMouseEnter={(e) => (e.currentTarget.style.color = t.text)}
+                                onMouseLeave={(e) => (e.currentTarget.style.color = t.textSec)}>
+                                <ChevronRight size={11} className="flex-shrink-0 transition-transform duration-200"
+                                  style={{ transform: isCol ? "rotate(0deg)" : "rotate(90deg)" }} />
+                                <Folder size={12} className="flex-shrink-0" style={{ color: t.textMuted }} />
+                                <span className="text-[11px] font-medium flex-1 truncate text-left">{folder}</span>
+                                <span className="text-[11px] flex-shrink-0" style={{ color: t.textFaint }}>{list.length}</span>
+                              </div>
+                              {!isCol && list.map((leaf) => renderRemoteLeaf(r.name, leaf, leaf.slice(folder.length + 1), 56))}
+                            </div>
+                          );
+                        })}
+                      </>
+                    );
+                  })()}
                 </div>
               );
             })}
@@ -2367,6 +2444,137 @@ function CreateRepoDialog({ accounts, defaultName, busy, onCancel, onConfirm }: 
   );
 }
 
+// ─── CloneDialog (clone a remote repo over http(s)/ssh into a local folder) ──
+
+function CloneDialog({ onClose, onDone }: {
+  onClose: () => void;
+  onDone: (path: string) => void;
+}) {
+  const t = useTheme();
+  const [url, setUrl] = useState("");
+  const [dest, setDest] = useState("");
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [prog, setProg] = useState<CloneProgress | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const trimmedUrl = url.trim();
+  const isHttp = /^https?:\/\//i.test(trimmedUrl);
+  // Accept https://, git@host:…, ssh://, git://, or any path ending in .git.
+  const looksValid =
+    /^(https?|ssh|git):\/\//i.test(trimmedUrl) ||
+    /^[\w.-]+@[\w.-]+:/.test(trimmedUrl) ||
+    /\.git$/i.test(trimmedUrl);
+  const name = trimmedUrl ? repoNameFromUrl(trimmedUrl) : "";
+  const canSubmit = !!trimmedUrl && looksValid && !!dest && !busy;
+
+  const pickDest = async () => {
+    if (busy) return;
+    const folder = await pickCloneParent();
+    if (folder) setDest(folder);
+  };
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    setBusy(true);
+    setErr(null);
+    setProg({ phase: "准备克隆", percent: null, raw: "" });
+    // For HTTPS, use the token typed here, else fall back to a configured account.
+    const tok = isHttp ? (token.trim() || pickRemoteToken(trimmedUrl)) : undefined;
+    try {
+      const path = await cloneRepo(trimmedUrl, dest, tok, (p) => setProg(p));
+      toast.success(`已克隆仓库：${name}`, { description: path });
+      onDone(path); // parent opens it as a project & closes the dialog
+    } catch (e) {
+      setErr(String(e));
+      setBusy(false);
+      setProg(null);
+    }
+  };
+
+  const cancelFooter = (
+    <>
+      <button {...(busy ? {} : press(onClose))} disabled={busy}
+        className="px-3.5 py-2 text-xs font-medium"
+        style={{ color: busy ? t.textFaint : t.textMuted, borderRadius: R - 2,
+          border: `0.5px solid ${t.inputBorder}`, cursor: busy ? "not-allowed" : "pointer" }}>取消</button>
+      <button {...(canSubmit ? press(submit) : {})} disabled={!canSubmit}
+        className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold"
+        style={{ background: canSubmit ? t.accent : t.inputBg, color: canSubmit ? "#fff" : t.textFaint,
+          borderRadius: R - 2, cursor: canSubmit ? "pointer" : "not-allowed" }}>
+        {busy ? <RefreshCw size={12} className="animate-spin" /> : <Cloud size={12} />}
+        {busy ? "克隆中…" : "克隆"}
+      </button>
+    </>
+  );
+
+  return (
+    <Modal title="克隆仓库" Icon={Cloud} onClose={busy ? () => {} : onClose} width={480} footer={cancelFooter}>
+      <Field label="仓库地址（HTTP 或 SSH）">
+        <input autoFocus value={url} onChange={(e) => setUrl(e.target.value)} disabled={busy}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+          placeholder="https://github.com/user/repo.git 或 git@github.com:user/repo.git"
+          className="text-xs px-2.5 py-2 outline-none font-mono w-full"
+          style={dlgCtl(t, trimmedUrl.length > 0 && !looksValid)} />
+        {trimmedUrl.length > 0 && !looksValid && (
+          <span className="text-[11px]" style={{ color: t.red }}>无法识别的地址，请粘贴完整的 HTTP 或 SSH 克隆地址</span>
+        )}
+      </Field>
+
+      <Field label="克隆到">
+        <button {...(busy ? {} : press(pickDest))} disabled={busy}
+          className="flex items-center gap-2 px-2.5 py-2 text-xs text-left w-full"
+          style={{ ...dlgCtl(t), cursor: busy ? "not-allowed" : "pointer" }}>
+          <FolderOpen size={13} style={{ color: t.textMuted, flexShrink: 0 }} />
+          <span className="truncate" style={{ color: dest ? t.text : t.textFaint }}>
+            {dest || "选择一个文件夹…"}
+          </span>
+        </button>
+        {dest && name && (
+          <span className="text-[11px] font-mono truncate" style={{ color: t.textFaint }}>
+            将克隆到：{dest}/{name}
+          </span>
+        )}
+      </Field>
+
+      {isHttp && (
+        <Field label="访问令牌（可选，私有仓库需要）">
+          <input value={token} onChange={(e) => setToken(e.target.value)} disabled={busy}
+            type="password" placeholder="留空则使用已配置的账号令牌"
+            className="text-xs px-2.5 py-2 outline-none font-mono w-full" style={dlgCtl(t)} />
+        </Field>
+      )}
+
+      {prog && (
+        <div className="flex flex-col gap-2 pt-1">
+          <div className="flex items-center justify-between text-[11px]">
+            <span style={{ color: t.textSec }}>{prog.phase}</span>
+            <span className="font-mono" style={{ color: t.textMuted }}>
+              {prog.percent != null ? `${prog.percent}%` : ""}
+            </span>
+          </div>
+          <div className="w-full overflow-hidden" style={{ height: 6, background: t.inputBg, borderRadius: 999 }}>
+            <div className={prog.percent == null ? "animate-pulse" : undefined}
+              style={{ height: "100%", width: prog.percent != null ? `${prog.percent}%` : "100%",
+                background: t.accent, borderRadius: 999, transition: "width 0.2s ease",
+                opacity: prog.percent != null ? 1 : 0.45 }} />
+          </div>
+          {prog.raw && (
+            <span className="text-[10px] font-mono truncate" style={{ color: t.textFaint }}>{prog.raw}</span>
+          )}
+        </div>
+      )}
+
+      {err && !busy && (
+        <div className="flex items-start gap-1.5 text-[11px]" style={{ color: t.red }}>
+          <AlertTriangle size={13} className="flex-shrink-0 mt-px" />
+          <span className="min-w-0 break-words">{err}</span>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 // ─── CreateBranchDialog ─────────────────────────────────────────────────────
 
 function CreateBranchDialog({ branches, defaultBase, onCancel, onConfirm }: {
@@ -3493,6 +3701,10 @@ export default function App() {
   const openDetail = () => { setDetailClosing(false); setDetailOpen(true); };
   const closeDetail = () => { setDetailOpen(false); setDetailClosing(true); };
   const [gitBusy, setGitBusy] = useState<null | "fetch" | "pull" | "push">(null);
+  // Mirror gitBusy in a ref so the working-tree watcher can skip reloads during a
+  // git op without re-subscribing the watcher every time gitBusy flips.
+  const gitBusyRef = useRef(gitBusy);
+  gitBusyRef.current = gitBusy;
   const [busyLabel, setBusyLabel] = useState<string | null>(null); // generic blocking-op overlay
   const realCache = useRef<Map<string, RealData>>(new Map());
   const lastLoadedPath = useRef<string | null>(null);   // to tell a switch from a refresh
@@ -3817,14 +4029,21 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, reloadTick]);
 
-  // Watch the working tree for changes made outside the app (edits in an editor):
-  // poll `git status` on an interval and immediately when the window regains focus,
-  // merging in the fresh file list while preserving the UI's staged selection.
+  // Watch the working tree for changes made outside the app (edits in an editor).
+  // Primary signal is a native filesystem watcher (backend `notify`), which fires
+  // within tens of ms of a save — no more waiting for a poll tick. A `git status`
+  // reload is coalesced (debounced) so an editor's burst of write events triggers
+  // one refresh, and the fresh file list is merged in while preserving the UI's
+  // staged selection. A slow interval + a refresh-on-focus stay as a safety net,
+  // and also pick up changes the watcher skips on purpose (terminal git add/commit
+  // only touch `.git/`, which the watcher filters out to avoid a reload loop).
   useEffect(() => {
     if (!path || !dataReady) return;
     let stopped = false;
-    const poll = async () => {
-      if (stopped || gitBusy) return;
+    let debounce: number | null = null;
+
+    const reload = async () => {
+      if (stopped || gitBusyRef.current) return;
       try {
         const fresh = await loadStatus(path);
         if (stopped) return;
@@ -3838,18 +4057,36 @@ export default function App() {
         });
       } catch { /* ignore transient status errors */ }
     };
-    const id = window.setInterval(poll, 3000);
-    const onFocus = () => poll();
+    const scheduleReload = () => {
+      if (debounce) window.clearTimeout(debounce);
+      debounce = window.setTimeout(reload, 150);
+    };
+
+    // Filesystem watcher (near-instant). If it can't start (e.g. running in a
+    // browser via `npm run dev`), the interval + focus fallbacks still cover it.
+    startWatch(path).catch(() => {});
+    let unlisten: (() => void) | null = null;
+    listen<string>("working-tree-changed", (e) => {
+      if (e.payload === path) scheduleReload();
+    }).then((fn) => { if (stopped) fn(); else unlisten = fn; }).catch(() => {});
+
+    // Safety net.
+    const id = window.setInterval(reload, 4000);
+    const onFocus = () => reload();
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
+
     return () => {
       stopped = true;
+      if (debounce) window.clearTimeout(debounce);
       window.clearInterval(id);
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
+      if (unlisten) unlisten();
+      stopWatch(path).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, dataReady, gitBusy]);
+  }, [path, dataReady]);
 
   const doCreateBranch = async (name: string, base: string) => {
     if (!activeProject) return;
@@ -3963,6 +4200,7 @@ export default function App() {
   // configured account, wire it as origin, then push the current branch.
   const [createRepoOpen, setCreateRepoOpen] = useState(false);
   const [createRepoBusy, setCreateRepoBusy] = useState(false);
+  const [cloneOpen, setCloneOpen] = useState(false);
   const doCreateRepoAndPush = async (account: GithubAccount, name: string, isPrivate: boolean, description: string) => {
     if (!activeProject) return;
     const p = activeProject.path;
@@ -4162,6 +4400,38 @@ export default function App() {
     if (checkoutTarget) performCheckout(checkoutTarget.branch, stash);
   };
 
+  // Double-click a remote branch in the sidebar (远程 → origin → main):
+  //  • a local branch of that name already exists → just switch to it (reuses the
+  //    dirty-tree / stash flow of a normal checkout);
+  //  • no local branch yet → create one tracking the remote and check it out.
+  const requestSyncRemote = async (remoteName: string, leaf: string) => {
+    if (!isReal || !activeProject) { toast("仅真实仓库支持此操作"); return; }
+    if (branches.some((b) => b.name === leaf)) { requestCheckout(leaf); return; }
+    const tid = toast.loading(`正在将 ${remoteName}/${leaf} 同步到本地…`);
+    try {
+      await createBranch(activeProject.path, leaf, `${remoteName}/${leaf}`, true);
+      setCurrentBranch(leaf);
+      setProjects((prev) => prev.map((p) => p.id === activeProjectId ? { ...p, branch: leaf } : p));
+      realCache.current.delete(activeProject.path);
+      pendingViewReset.current = true;
+      setReloadTick((n) => n + 1);
+      toast.success(`已创建本地分支 ${leaf} 并检出`, { id: tid });
+    } catch (e) { toast.error(`同步失败：${e}`, { id: tid }); }
+  };
+
+  // Create a local branch tracking the remote WITHOUT switching to it (the
+  // right-click "只建不切" option). Only offered when no local branch exists yet.
+  const createLocalFromRemote = async (remoteName: string, leaf: string) => {
+    if (!activeProject) return;
+    const tid = toast.loading(`正在创建本地分支 ${leaf}…`);
+    try {
+      await createBranch(activeProject.path, leaf, `${remoteName}/${leaf}`, false);
+      realCache.current.delete(activeProject.path);
+      setReloadTick((n) => n + 1);
+      toast.success(`已创建本地分支 ${leaf}`, { id: tid });
+    } catch (e) { toast.error(`创建失败：${e}`, { id: tid }); }
+  };
+
   const requestCherryPick = (commit: Commit) => setCherryTarget(commit);
   // Cherry-pick entry from the ActionBar: needs a commit open in the detail view.
   const requestCherryPickActive = () => {
@@ -4254,24 +4524,41 @@ export default function App() {
     });
   };
 
+  // Open a repo at `repoPath` as a project tab (reused by "open" and "clone").
+  // Switches to it if already open; otherwise adds a new tab. Returns the info.
+  const openRepoAsProject = async (repoPath: string): Promise<RepoInfo> => {
+    const info = await openRepo(repoPath);
+    const existing = projects.find((p) => p.path === info.path);
+    if (existing) { setActiveProjectId(existing.id); return info; }
+    const palette = ["#6b6bff", "#34d399", "#f59e0b", "#60a5fa", "#f472b6", "#22d3ee"];
+    const id = "real-" + Date.now();
+    const proj: Project = {
+      id, name: info.name, branch: info.current_branch,
+      color: palette[projects.length % palette.length], changes: 0, path: info.path,
+    };
+    setProjects((prev) => [...prev, proj]);
+    setActiveProjectId(id);
+    return info;
+  };
+
   const handleOpenNew = async () => {
     try {
       const folder = await pickRepoFolder();
       if (!folder) return;
-      const info = await openRepo(folder);
-      const existing = projects.find((p) => p.path === info.path);
-      if (existing) { setActiveProjectId(existing.id); return; }
-      const palette = ["#6b6bff", "#34d399", "#f59e0b", "#60a5fa", "#f472b6", "#22d3ee"];
-      const id = "real-" + Date.now();
-      const proj: Project = {
-        id, name: info.name, branch: info.current_branch,
-        color: palette[projects.length % palette.length], changes: 0, path: info.path,
-      };
-      setProjects((prev) => [...prev, proj]);
-      setActiveProjectId(id);
+      const info = await openRepoAsProject(folder);
       toast.success(`已打开仓库：${info.name}`);
     } catch (e) {
       toast.error(`打开失败：${e}`);
+    }
+  };
+
+  // Called by CloneDialog once the clone lands: open the fresh repo as a project.
+  const handleCloneDone = async (clonedPath: string) => {
+    setCloneOpen(false);
+    try {
+      await openRepoAsProject(clonedPath);
+    } catch (e) {
+      toast.error(`打开克隆的仓库失败：${e}`);
     }
   };
 
@@ -4296,6 +4583,7 @@ export default function App() {
           <TitleBar projects={projects} activeId={activeProjectId} branch={currentBranch}
             themeMode={themeMode} onThemeCycle={cycleTheme}
             onSelectProject={handleSelectProject} onOpenNew={handleOpenNew}
+            onCloneNew={() => setCloneOpen(true)}
             onOpenSettings={() => setSettingsOpen(true)} />
 
           <ProjectTabBar projects={projects} activeId={activeProjectId}
@@ -4303,7 +4591,8 @@ export default function App() {
             onClose={handleCloseProject}
             onAdd={handleOpenNew} />
 
-          <ActionBar onCreateBranch={activeProject ? () => setCreateBranchOpen(true) : undefined}
+          <ActionBar onClone={() => setCloneOpen(true)}
+            onCreateBranch={activeProject ? () => setCreateBranchOpen(true) : undefined}
             onFetch={activeProject ? () => runGitAction("fetch") : undefined}
             onPull={activeProject ? () => runGitAction("pull") : undefined}
             onPush={activeProject ? () => runGitAction("push") : undefined}
@@ -4321,11 +4610,19 @@ export default function App() {
                 <span className="text-sm font-medium" style={{ color: theme.textSec }}>还没有打开任何仓库</span>
                 <span className="text-xs" style={{ color: theme.textFaint }}>打开一个 Git 仓库开始</span>
               </div>
-              <button onClick={handleOpenNew}
-                className="flex items-center gap-2 px-4 py-2 cursor-pointer"
-                style={{ background: theme.accent, color: "#fff", borderRadius: R, fontSize: 13, fontWeight: 500 }}>
-                <Plus size={14} /> 打开仓库
-              </button>
+              <div className="flex items-center gap-2.5">
+                <button onClick={handleOpenNew}
+                  className="flex items-center gap-2 px-4 py-2 cursor-pointer"
+                  style={{ background: theme.accent, color: "#fff", borderRadius: R, fontSize: 13, fontWeight: 500 }}>
+                  <Plus size={14} /> 打开仓库
+                </button>
+                <button onClick={() => setCloneOpen(true)}
+                  className="flex items-center gap-2 px-4 py-2 cursor-pointer"
+                  style={{ background: "transparent", color: theme.text, borderRadius: R, fontSize: 13, fontWeight: 500,
+                    border: `0.5px solid ${theme.inputBorder}` }}>
+                  <Cloud size={14} /> 克隆仓库
+                </button>
+              </div>
             </div>
           ) : (
           <div className="flex flex-1 overflow-hidden">
@@ -4338,6 +4635,18 @@ export default function App() {
               onShowAll={() => setFocus(null)}
               onHoverBranch={setHoverBranch}
               onCheckout={requestCheckout}
+              onSyncRemote={requestSyncRemote}
+              onRemoteContext={(e, remoteName, leaf) => {
+                const hasLocal = branches.some((b) => b.name === leaf);
+                openCtx(e, [
+                  hasLocal
+                    ? { label: `切换到本地分支 ${leaf}`, Icon: GitBranch, onClick: () => requestSyncRemote(remoteName, leaf) }
+                    : { label: "同步到本地并检出", Icon: Download, onClick: () => requestSyncRemote(remoteName, leaf) },
+                  ...(!hasLocal ? [{ label: "仅创建本地分支（不切换）", Icon: GitBranchPlus, onClick: () => createLocalFromRemote(remoteName, leaf) } as CtxItem] : []),
+                  { sep: true },
+                  { label: "复制分支名", Icon: Copy, onClick: () => { navigator.clipboard.writeText(`${remoteName}/${leaf}`).catch(() => {}); } },
+                ]);
+              }}
               onStashClick={openStash}
               onStashApply={doStashApply} onStashDrop={doStashDrop}
               onStashContext={(e, s) => openCtx(e, [
@@ -4577,6 +4886,10 @@ export default function App() {
             busy={createRepoBusy}
             onCancel={() => { if (!createRepoBusy) setCreateRepoOpen(false); }}
             onConfirm={doCreateRepoAndPush} />
+        )}
+
+        {cloneOpen && (
+          <CloneDialog onClose={() => setCloneOpen(false)} onDone={handleCloneDone} />
         )}
 
         {tagDialogOpen && activeProject && (

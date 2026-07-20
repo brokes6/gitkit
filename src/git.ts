@@ -1,7 +1,7 @@
 // GitKit — frontend Git API. Wraps the Rust `invoke` commands and maps their
 // output into the shapes the existing UI components already consume.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
   Branch,
@@ -216,6 +216,59 @@ export async function pickRepoFolder(): Promise<string | null> {
 
 export async function openRepo(path: string): Promise<RepoInfo> {
   return invoke<RepoInfo>("open_repo", { path });
+}
+
+/** Start watching a repo's working tree; the backend emits `working-tree-changed`
+ *  (payload = the repo path) on any file change outside `.git/`. Idempotent. */
+export async function startWatch(path: string): Promise<void> {
+  await invoke("start_watch", { path });
+}
+
+/** Stop watching a repo's working tree. */
+export async function stopWatch(path: string): Promise<void> {
+  await invoke("stop_watch", { path });
+}
+
+/** Native folder picker for the destination a repo will be cloned INTO (the
+ *  parent directory). Returns the chosen path, or null if cancelled. */
+export async function pickCloneParent(): Promise<string | null> {
+  const sel = await openDialog({
+    directory: true,
+    multiple: false,
+    title: "选择克隆到的文件夹",
+  });
+  return typeof sel === "string" ? sel : null;
+}
+
+/** The folder name a clone URL would produce — last path segment, ".git" stripped.
+ *  Handles "https://host/g/repo.git" and "git@host:g/repo.git". Falls back to "repo". */
+export function repoNameFromUrl(url: string): string {
+  const trimmed = url.trim().replace(/\/+$/, "");
+  const last = trimmed.split(/[/:]/).pop() ?? "";
+  const name = last.replace(/\.git$/i, "").trim();
+  return name || "repo";
+}
+
+/** One streamed progress update from a running clone. `percent` is null on lines
+ *  that carry no percentage (kept in sync with Rust's CloneProgress). */
+export interface CloneProgress {
+  phase: string;
+  percent: number | null;
+  raw: string;
+}
+
+/** Clone `url` into a new subfolder of `dest`, streaming progress via `onProgress`.
+ *  Resolves to the cloned repository's absolute path. `token` (optional)
+ *  authenticates HTTPS; SSH uses the user's keys. */
+export async function cloneRepo(
+  url: string,
+  dest: string,
+  token: string | undefined,
+  onProgress: (p: CloneProgress) => void,
+): Promise<string> {
+  const channel = new Channel<CloneProgress>();
+  channel.onmessage = onProgress;
+  return invoke<string>("git_clone", { url, dest, token: token ?? null, onProgress: channel });
 }
 
 export async function loadBranches(path: string): Promise<Branch[]> {
