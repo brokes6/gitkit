@@ -487,6 +487,17 @@ export async function createBranch(
   await invoke("git_create_branch", { path, name, base, checkout });
 }
 
+/** Delete a local branch. `force` (-D) drops unmerged commits; the default (-d)
+ *  refuses when the branch isn't fully merged. Cannot delete the current branch. */
+export async function deleteBranch(path: string, name: string, force = false): Promise<void> {
+  await invoke("git_delete_branch", { path, name, force });
+}
+
+/** Rename a local branch (git branch -m). Works on the current branch too. */
+export async function renameBranch(path: string, from: string, to: string): Promise<void> {
+  await invoke("git_rename_branch", { path, from, to });
+}
+
 /** Check out `branch` and fast-forward it to `hash` (sync local up to a remote commit). */
 export async function checkoutSync(path: string, branch: string, hash: string): Promise<void> {
   await invoke("git_checkout_sync", { path, branch, hash });
@@ -625,4 +636,14 @@ export async function checkForUpdate(): Promise<
       await relaunch();
     },
   };
+}
+
+/** Current application version (from tauri.conf.json). Empty string outside the Tauri shell. */
+export async function getAppVersion(): Promise<string> {
+  try {
+    const { getVersion } = await import("@tauri-apps/api/app");
+    return await getVersion();
+  } catch {
+    return "";
+  }
 }

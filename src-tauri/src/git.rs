@@ -947,6 +947,38 @@ pub async fn git_create_branch(
     .await
 }
 
+/// Delete a local branch. `force` uses `-D` (drops unmerged commits); otherwise
+/// `-d`, which refuses to delete a branch whose work isn't merged. Cannot delete
+/// the currently checked-out branch (git rejects it).
+#[tauri::command]
+pub async fn git_delete_branch(path: String, name: String, force: bool) -> Result<(), String> {
+    run_blocking(move || {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("分支名称不能为空".into());
+        }
+        run_git(&path, &["branch", if force { "-D" } else { "-d" }, name])?;
+        Ok(())
+    })
+    .await
+}
+
+/// Rename a local branch (`git branch -m from to`). Works on the current branch
+/// too. Refuses when `to` already exists (git errors, surfaced to the caller).
+#[tauri::command]
+pub async fn git_rename_branch(path: String, from: String, to: String) -> Result<(), String> {
+    run_blocking(move || {
+        let from = from.trim();
+        let to = to.trim();
+        if to.is_empty() {
+            return Err("新分支名称不能为空".into());
+        }
+        run_git(&path, &["branch", "-m", from, to])?;
+        Ok(())
+    })
+    .await
+}
+
 #[derive(serde::Serialize)]
 pub struct TagInfo {
     pub name: String,

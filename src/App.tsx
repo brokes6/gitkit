@@ -9,14 +9,14 @@ import {
   Moon, Sun, Monitor, Plus, Minus, X, FolderOpen, ArrowRight,
   Pin, EyeOff, Eye, Folder, AlertTriangle, Cloud, GitBranchPlus, ChevronLeft, LayoutGrid,
   Settings, UserPlus, Trash2, Star, Users, Github, Laptop, Sparkles, RotateCcw, TerminalSquare,
-  Tag as TagIcon, Square,
+  Tag as TagIcon, Square, DownloadCloud, Pencil,
 } from "lucide-react";
 import {
   pickRepoFolder, openRepo, loadBranches, loadRemotes, loadHistory,
   loadStatus, loadCommitFiles, commitFileDiff, workingFileDiff, filePreview,
   attributeBranches, computeGraph, hasChanges, checkoutBranch, stashPush, stashList, stashApply, stashDrop, stashFiles, stashFileDiff, cherryPick, cherryPickPreflight,
-  createBranch, checkoutSync, commit as gitCommit, fetchAll, pull, push, gitlabTest, githubTest,
-  createPullRequest, branchColor, setVibrancy, checkForUpdate, discardFile, discardAll,
+  createBranch, deleteBranch, renameBranch, checkoutSync, commit as gitCommit, fetchAll, pull, push, gitlabTest, githubTest,
+  createPullRequest, branchColor, setVibrancy, checkForUpdate, getAppVersion, discardFile, discardAll,
   checkDeps, mergePreview, loadTags, createTag, pushTag, githubCreateRepo, gitRemoteAdd,
   cloneRepo, pickCloneParent, repoNameFromUrl, startWatch, stopWatch,
 } from "./git";
@@ -750,18 +750,23 @@ function ProjectTab({ project, isActive, isLast, onSelect, onClose }: {
           {project.branch}
         </span>
       </div>
-      {project.changes > 0 && !hovered && (
-        <span className="flex-shrink-0 text-[11px] font-bold px-1.5 py-px"
+      {/* The changes badge stays in the layout at all times so the tab width never
+          shifts on hover; it just fades out to reveal the close button, which is
+          absolutely positioned (out of flow) and overlays the same slot. */}
+      {project.changes > 0 && (
+        <span className="flex-shrink-0 text-[11px] font-bold px-1.5 py-px transition-opacity duration-100"
           style={{ background: project.color + "20", color: project.color,
             border: `1px solid ${project.color}44`, borderRadius: 20,
-            boxShadow: `0 0 6px ${project.color}22` }}>
+            boxShadow: `0 0 6px ${project.color}22`,
+            opacity: hovered && onClose ? 0 : 1 }}>
           {project.changes}
         </span>
       )}
       {hovered && onClose && (
         <button onClick={(e) => { e.stopPropagation(); onClose(); }}
-          className="flex-shrink-0 flex items-center justify-center w-4 h-4 transition-colors"
-          style={{ color: t.textMuted, borderRadius: 6, background: "transparent" }}
+          className="absolute flex items-center justify-center w-4 h-4 transition-colors"
+          style={{ right: 16, top: "50%", transform: "translateY(-50%)",
+            color: t.textMuted, borderRadius: 6, background: "transparent" }}
           onMouseEnter={(e) => { e.currentTarget.style.background = t.redBg; e.currentTarget.style.color = t.red; }}
           onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = t.textMuted; }}>
           <X size={9} />
@@ -945,7 +950,7 @@ function SidebarSection({ label, open, onToggle }: { label: string; open: boolea
 
 function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidden, setHidden,
   pinned, setPinned, collapsed, setCollapsed,
-  onFocus, onShowAll, onHoverBranch, onCheckout, onSyncRemote, onRemoteContext, onStashClick, onStashApply, onStashDrop, onStashContext, selectedStashIndex }: {
+  onFocus, onShowAll, onHoverBranch, onCheckout, onBranchContext, onSyncRemote, onRemoteContext, onStashClick, onStashApply, onStashDrop, onStashContext, selectedStashIndex }: {
   branches: Branch[]; remotes: Remote[]; stashes: Stash[];
   currentBranch: string; focusBranch: string | null;
   hidden: string[]; setHidden: React.Dispatch<React.SetStateAction<string[]>>;
@@ -954,6 +959,7 @@ function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidde
   onFocus: (name: string) => void; onShowAll: () => void;
   onHoverBranch: (name: string | null) => void;
   onCheckout?: (name: string) => void;
+  onBranchContext?: (e: React.MouseEvent, b: Branch) => void;
   onSyncRemote?: (remoteName: string, leaf: string) => void;
   onRemoteContext?: (e: React.MouseEvent, remoteName: string, leaf: string) => void;
   onStashClick?: (s: Stash) => void;
@@ -995,6 +1001,7 @@ function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidde
     const baseBg = active ? t.rowSelected : b.current ? currentBg : "transparent";
     return (
       <div key={b.name} onClick={() => onFocus(b.name)} onDoubleClick={() => onCheckout?.(b.name)}
+        onContextMenu={(e) => onBranchContext?.(e, b)}
         className="group flex items-center gap-2 pr-2 cursor-pointer"
         style={{ ...itemStyle(active), background: baseBg, paddingLeft: indent ? 26 : 12, height: 30 }}
         title={`单击只看此分支 · 双击切换到 ${b.name}`}
@@ -2349,8 +2356,8 @@ function ConfirmDialog({ title, message, confirmLabel, busy, onCancel, onConfirm
   );
 }
 
-function ModalFooter({ onCancel, onConfirm, confirmLabel, disabled, busy }: {
-  onCancel: () => void; onConfirm: () => void; confirmLabel: string; disabled?: boolean; busy?: boolean;
+function ModalFooter({ onCancel, onConfirm, confirmLabel, disabled, busy, danger }: {
+  onCancel: () => void; onConfirm: () => void; confirmLabel: string; disabled?: boolean; busy?: boolean; danger?: boolean;
 }) {
   const t = useTheme();
   const dis = !!disabled || !!busy;
@@ -2361,7 +2368,7 @@ function ModalFooter({ onCancel, onConfirm, confirmLabel, disabled, busy }: {
         style={{ color: t.textMuted, borderRadius: R - 2, border: `0.5px solid ${t.inputBorder}` }}>取消</button>
       <button {...(dis ? {} : press(onConfirm))} disabled={dis}
         className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold"
-        style={{ background: dis ? t.inputBg : t.accent, color: dis ? t.textFaint : "#fff",
+        style={{ background: dis ? t.inputBg : danger ? t.red : t.accent, color: dis ? t.textFaint : "#fff",
           borderRadius: R - 2, cursor: dis ? "not-allowed" : "pointer" }}>
         {busy && <RefreshCw size={12} className="animate-spin" />}
         {confirmLabel}
@@ -2577,21 +2584,33 @@ function CloneDialog({ onClose, onDone }: {
 
 // ─── CreateBranchDialog ─────────────────────────────────────────────────────
 
-function CreateBranchDialog({ branches, defaultBase, onCancel, onConfirm }: {
-  branches: Branch[]; defaultBase: string;
-  onCancel: () => void; onConfirm: (name: string, base: string) => void;
+// How to treat uncommitted changes when creating (and switching to) a branch.
+type DirtyMode = "carry" | "stash" | "discard";
+
+function CreateBranchDialog({ branches, defaultBase, dirty, onCancel, onConfirm }: {
+  branches: Branch[]; defaultBase: string; dirty: boolean;
+  onCancel: () => void; onConfirm: (name: string, base: string, mode: DirtyMode) => void;
 }) {
   const t = useTheme();
   const [name, setName] = useState("");
   const [base, setBase] = useState(defaultBase);
+  const [mode, setMode] = useState<DirtyMode>("carry");
   const trimmed = name.trim();
   const exists = branches.some((b) => b.name === trimmed);
   const valid = trimmed.length > 0 && !exists && !/\s/.test(trimmed);
-  const submit = () => { if (valid) onConfirm(trimmed, base); };
+  const submit = () => { if (valid) onConfirm(trimmed, base, dirty ? mode : "carry"); };
+
+  const MODES: { key: DirtyMode; Icon: React.ElementType; label: string; desc: string; danger?: boolean }[] = [
+    { key: "carry",   Icon: ArrowRight, label: "带到新分支", desc: "把未提交更改一起带到新分支（默认）" },
+    { key: "stash",   Icon: Layers,     label: "储藏改动",   desc: "先储藏（git stash），新分支保持干净，可稍后恢复" },
+    { key: "discard", Icon: Trash2,     label: "放弃改动",   desc: "丢弃所有未提交更改，不可撤销", danger: true },
+  ];
 
   return (
     <Modal title="新建分支" Icon={GitBranchPlus} onClose={onCancel} width={460}
-      footer={<ModalFooter onCancel={onCancel} onConfirm={submit} confirmLabel="创建并切换" disabled={!valid} />}>
+      footer={<ModalFooter onCancel={onCancel} onConfirm={submit}
+        confirmLabel={dirty && mode === "stash" ? "储藏并创建" : dirty && mode === "discard" ? "放弃并创建" : "创建并切换"}
+        disabled={!valid} danger={dirty && mode === "discard"} />}>
       <Field label="基于分支">
         <select value={base} onChange={(e) => setBase(e.target.value)}
           className="text-xs px-2.5 py-2 cursor-pointer outline-none w-full" style={dlgCtl(t)}>
@@ -2605,6 +2624,87 @@ function CreateBranchDialog({ branches, defaultBase, onCancel, onConfirm }: {
           className="text-xs px-2.5 py-2 outline-none font-mono w-full" style={dlgCtl(t, exists)} />
         {exists && <span className="text-[11px]" style={{ color: t.red }}>分支 {trimmed} 已存在</span>}
       </Field>
+
+      {dirty && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-1.5 text-[11px]" style={{ color: t.amber }}>
+            <AlertTriangle size={12} className="flex-shrink-0" />
+            <span>当前有未提交的更改，选择如何处理：</span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {MODES.map((m) => {
+              const active = mode === m.key;
+              const tint = m.danger ? t.red : t.accent;
+              return (
+                <button key={m.key} {...press(() => setMode(m.key))}
+                  className="flex items-start gap-2.5 px-3 py-2 text-left cursor-pointer transition-colors"
+                  style={{ borderRadius: R - 2,
+                    border: `0.5px solid ${active ? tint : t.inputBorder}`,
+                    background: active ? tint + "14" : "transparent" }}>
+                  <m.Icon size={14} className="flex-shrink-0 mt-0.5" style={{ color: active ? tint : t.textMuted }} />
+                  <div className="flex flex-col min-w-0 flex-1">
+                    <span className="text-xs font-medium" style={{ color: active ? (m.danger ? t.red : t.text) : t.textSec }}>{m.label}</span>
+                    <span className="text-[10px] leading-snug" style={{ color: t.textFaint }}>{m.desc}</span>
+                  </div>
+                  {active && <Check size={13} className="flex-shrink-0 mt-0.5" style={{ color: tint }} />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ─── RenameBranchDialog ─────────────────────────────────────────────────────
+// Rename a local branch — for fixing a wrongly-named branch created by mistake.
+
+function RenameBranchDialog({ branch, branches, onCancel, onConfirm }: {
+  branch: Branch; branches: Branch[];
+  onCancel: () => void; onConfirm: (newName: string) => void;
+}) {
+  const t = useTheme();
+  const [name, setName] = useState(branch.name);
+  const trimmed = name.trim();
+  const exists = trimmed !== branch.name && branches.some((b) => b.name === trimmed);
+  const valid = trimmed.length > 0 && trimmed !== branch.name && !exists && !/\s/.test(trimmed);
+  const submit = () => { if (valid) onConfirm(trimmed); };
+
+  return (
+    <Modal title={`重命名分支 ${branch.name}`} Icon={Pencil} onClose={onCancel} width={460}
+      footer={<ModalFooter onCancel={onCancel} onConfirm={submit} confirmLabel="重命名" disabled={!valid} />}>
+      <Field label="新分支名称">
+        <input autoFocus value={name} onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+          placeholder="feature/right-name"
+          className="text-xs px-2.5 py-2 outline-none font-mono w-full" style={dlgCtl(t, exists)} />
+        {exists && <span className="text-[11px]" style={{ color: t.red }}>分支 {trimmed} 已存在</span>}
+      </Field>
+    </Modal>
+  );
+}
+
+// ─── StashDialog ─────────────────────────────────────────────────────────────
+// Optional title for a stash; empty falls back to the backend default.
+
+function StashDialog({ busy, onCancel, onConfirm }: {
+  busy?: boolean; onCancel: () => void; onConfirm: (message: string) => void;
+}) {
+  const t = useTheme();
+  const [message, setMessage] = useState("");
+  const submit = () => onConfirm(message.trim());
+
+  return (
+    <Modal title="储藏更改" Icon={Layers} onClose={onCancel} width={460}
+      footer={<ModalFooter onCancel={onCancel} onConfirm={submit} confirmLabel="储藏" busy={busy} />}>
+      <Field label="储藏标题（可选）">
+        <input autoFocus value={message} onChange={(e) => setMessage(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+          placeholder="GitKit stash（默认）"
+          className="text-xs px-2.5 py-2 outline-none w-full" style={dlgCtl(t)} />
+      </Field>
+      <span className="text-[11px]" style={{ color: t.textFaint }}>不填则使用默认标题。已跟踪与未跟踪的改动都会一起储藏。</span>
     </Modal>
   );
 }
@@ -2907,9 +3007,12 @@ function IdentitySettings({ identities, setIdentities, defaultId, setDefaultId }
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
   const valid = name.trim().length > 0 && /.+@.+\..+/.test(email.trim());
+  // The form is only mounted while adding a new identity or editing an existing one.
+  const showForm = adding || editingId !== null;
 
-  const reset = () => { setName(""); setEmail(""); setEditingId(null); };
+  const reset = () => { setName(""); setEmail(""); setEditingId(null); setAdding(false); };
   const submit = () => {
     if (!valid) return;
     const n = name.trim(), e = email.trim();
@@ -2922,7 +3025,8 @@ function IdentitySettings({ identities, setIdentities, defaultId, setDefaultId }
     }
     reset();
   };
-  const startEdit = (i: Identity) => { setEditingId(i.id); setName(i.name); setEmail(i.email); };
+  const startAdd = () => { setEditingId(null); setName(""); setEmail(""); setAdding(true); };
+  const startEdit = (i: Identity) => { setAdding(false); setEditingId(i.id); setName(i.name); setEmail(i.email); };
   const remove = (id: string) => {
     setIdentities((prev) => {
       const next = prev.filter((i) => i.id !== id);
@@ -2945,7 +3049,7 @@ function IdentitySettings({ identities, setIdentities, defaultId, setDefaultId }
 
       <div className="flex flex-col gap-1.5">
         {identities.length === 0 && (
-          <div className="text-[11px] px-1 py-6 text-center" style={{ color: t.textFaint }}>还没有身份,在下方添加一个</div>
+          <div className="text-[11px] px-1 py-6 text-center" style={{ color: t.textFaint }}>还没有身份,点击「新增身份」添加</div>
         )}
         {identities.map((i) => {
           const isDefault = i.id === defaultId;
@@ -2976,29 +3080,36 @@ function IdentitySettings({ identities, setIdentities, defaultId, setDefaultId }
         })}
       </div>
 
-      <div className="flex flex-col gap-2 p-3" style={{ background: t.inputBg + "80", borderRadius: R - 1, border: `0.5px solid ${t.border}` }}>
-        <span className="text-[11px] font-semibold" style={{ color: t.textMuted }}>
-          {editingId ? "编辑身份" : "添加身份"}
-        </span>
-        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="名称 (user.name)"
-          className="text-xs px-2.5 py-2 outline-none" style={inputStyle} />
-        <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="邮箱 (user.email)"
-          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-          className="text-xs px-2.5 py-2 outline-none font-mono" style={inputStyle} />
-        <div className="flex items-center justify-end gap-2">
-          {editingId && (
+      {showForm ? (
+        <div className="flex flex-col gap-2 p-3" style={{ background: t.inputBg + "80", borderRadius: R - 1, border: `0.5px solid ${t.border}` }}>
+          <span className="text-[11px] font-semibold" style={{ color: t.textMuted }}>
+            {editingId ? "编辑身份" : "新增身份"}
+          </span>
+          <input value={name} autoFocus onChange={(e) => setName(e.target.value)} placeholder="名称 (user.name)"
+            className="text-xs px-2.5 py-2 outline-none" style={inputStyle} />
+          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="邮箱 (user.email)"
+            onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+            className="text-xs px-2.5 py-2 outline-none font-mono" style={inputStyle} />
+          <div className="flex items-center justify-end gap-2">
             <button {...press(reset)} className="px-3 py-1.5 text-xs cursor-pointer"
               style={{ color: t.textMuted, borderRadius: R - 3 }}>取消</button>
-          )}
-          <button {...(valid ? press(submit) : {})} disabled={!valid}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
-            style={{ background: valid ? t.accent : t.inputBg, color: valid ? "#fff" : t.textFaint,
-              borderRadius: R - 3, opacity: valid ? 1 : 0.7, cursor: valid ? "pointer" : "not-allowed" }}>
-            {!editingId && <UserPlus size={12} />}
-            {editingId ? "保存" : "添加"}
-          </button>
+            <button {...(valid ? press(submit) : {})} disabled={!valid}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
+              style={{ background: valid ? t.accent : t.inputBg, color: valid ? "#fff" : t.textFaint,
+                borderRadius: R - 3, opacity: valid ? 1 : 0.7, cursor: valid ? "pointer" : "not-allowed" }}>
+              {editingId ? "保存" : "添加"}
+            </button>
+          </div>
         </div>
-      </div>
+      ) : (
+        <button {...press(startAdd)}
+          className="flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium cursor-pointer transition-colors"
+          style={{ color: t.textSec, borderRadius: R - 2, border: `0.5px dashed ${t.inputBorder}` }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = t.rowHover; e.currentTarget.style.color = t.text; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = t.textSec; }}>
+          <UserPlus size={13} /> 新增身份
+        </button>
+      )}
     </div>
   );
 }
@@ -3011,12 +3122,17 @@ function RemoteConnSettings({ storageKey, title, desc, urlPlaceholder, tokenPlac
   test: (url: string, token: string) => Promise<string>;
 }) {
   const t = useTheme();
-  const [url, setUrl] = useState(() => loadConn(storageKey).url);
-  const [token, setToken] = useState(() => loadConn(storageKey).token);
+  const [saved, setSaved] = useState<RemoteConn>(() => loadConn(storageKey));
+  const configured = saved.token.trim().length > 0;
+  // Show the integrated card once a connection is saved; when nothing is saved a
+  // "新增集成" button is shown instead. The form only appears while editing.
+  const [editing, setEditing] = useState(false);
+  const [url, setUrl] = useState(saved.url);
+  const [token, setToken] = useState(saved.token);
   const [showToken, setShowToken] = useState(false);
   const [status, setStatus] = useState<{ kind: "idle" | "testing" | "ok" | "err"; msg?: string }>({ kind: "idle" });
-  useEffect(() => { saveConn(storageKey, { url, token }); }, [storageKey, url, token]);
 
+  const canSave = token.trim().length > 0;
   const canTest = token.trim().length > 0 && status.kind !== "testing";
   const runTest = async () => {
     if (!canTest) return;
@@ -3026,6 +3142,23 @@ function RemoteConnSettings({ storageKey, title, desc, urlPlaceholder, tokenPlac
     } catch (e) {
       setStatus({ kind: "err", msg: String(e) });
     }
+  };
+  const beginEdit = () => { setUrl(saved.url); setToken(saved.token); setStatus({ kind: "idle" }); setShowToken(false); setEditing(true); };
+  const cancelEdit = () => { setUrl(saved.url); setToken(saved.token); setStatus({ kind: "idle" }); setShowToken(false); setEditing(false); };
+  const saveNow = () => {
+    if (!canSave) return;
+    const next = { url: url.trim(), token: token.trim() };
+    saveConn(storageKey, next);
+    setSaved(next);
+    setStatus({ kind: "idle" });
+    setEditing(false);
+  };
+  const removeNow = () => {
+    saveConn(storageKey, { url: "", token: "" });
+    setSaved({ url: "", token: "" });
+    setUrl(""); setToken(""); setStatus({ kind: "idle" }); setShowToken(false);
+    setEditing(false);
+    toast.success("已删除集成");
   };
 
   const inputStyle = { background: t.inputBg, color: t.text, border: `0.5px solid ${t.inputBorder}`, borderRadius: R - 3 } as const;
@@ -3037,48 +3170,106 @@ function RemoteConnSettings({ storageKey, title, desc, urlPlaceholder, tokenPlac
         <span className="text-[11px]" style={{ color: t.textFaint }}>{desc}</span>
       </div>
 
-      <div className="flex flex-col gap-1.5">
-        <span className="text-[11px] font-medium" style={{ color: t.textMuted }}>实例地址</span>
-        <input value={url} onChange={(e) => { setUrl(e.target.value); setStatus({ kind: "idle" }); }}
-          placeholder={urlPlaceholder}
-          className="text-xs px-2.5 py-2 outline-none font-mono" style={inputStyle} />
-      </div>
-
-      <div className="flex flex-col gap-1.5">
-        <span className="text-[11px] font-medium" style={{ color: t.textMuted }}>访问令牌</span>
-        <div className="flex items-center" style={{ ...inputStyle, paddingRight: 4 }}>
-          <input value={token} onChange={(e) => { setToken(e.target.value); setStatus({ kind: "idle" }); }}
-            type={showToken ? "text" : "password"} placeholder={tokenPlaceholder}
-            className="flex-1 text-xs px-2.5 py-2 outline-none font-mono bg-transparent" style={{ color: t.text }} />
-          <button {...press(() => setShowToken((v) => !v))} className="p-1.5 cursor-pointer flex-shrink-0"
-            style={{ color: t.textMuted }} title={showToken ? "隐藏" : "显示"}>
-            {showToken ? <EyeOff size={13} /> : <Eye size={13} />}
-          </button>
+      {configured && !editing ? (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-3 px-3.5 py-3"
+            style={{ borderRadius: R - 2, border: `0.5px solid ${t.accent}44`, background: t.accentBg }}>
+            <div className="flex items-center justify-center rounded-full flex-shrink-0"
+              style={{ width: 30, height: 30, background: t.isDark ? "rgba(255,255,255,0.08)" : "#fff" }}>
+              <Cloud size={15} style={{ color: t.accent }} />
+            </div>
+            <div className="flex flex-col min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium truncate" style={{ color: t.text }}>
+                  {hostOf(saved.url) || saved.url || "已集成"}
+                </span>
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0"
+                  style={{ background: t.greenBg, color: t.green }}>已集成</span>
+              </div>
+              <span className="text-[11px] font-mono truncate" style={{ color: t.textMuted }}>
+                ••••••••{saved.token.slice(-4)}
+              </span>
+            </div>
+            <button {...press(beginEdit)}
+              className="flex items-center gap-1 text-[11px] px-2 py-1 cursor-pointer flex-shrink-0"
+              style={{ color: t.textMuted, borderRadius: R - 4 }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = t.rowHover)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+              <Pencil size={12} /> 修改
+            </button>
+            <button {...press(removeNow)} title="删除"
+              className="p-1 cursor-pointer flex-shrink-0"
+              style={{ color: t.textMuted, borderRadius: R - 4 }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = t.redBg; e.currentTarget.style.color = t.red; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = t.textMuted; }}>
+              <Trash2 size={13} />
+            </button>
+          </div>
+          <span className="text-[10px]" style={{ color: t.textFaint }}>暂不支持多个集成,如需切换请修改或删除后重新填写。</span>
         </div>
-        <span className="text-[10px]" style={{ color: t.textFaint }}>{hint}</span>
-      </div>
+      ) : editing ? (
+        <>
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11px] font-medium" style={{ color: t.textMuted }}>实例地址</span>
+            <input value={url} onChange={(e) => { setUrl(e.target.value); setStatus({ kind: "idle" }); }}
+              placeholder={urlPlaceholder}
+              className="text-xs px-2.5 py-2 outline-none font-mono" style={inputStyle} />
+          </div>
 
-      <div className="flex items-center gap-3">
-        <button {...(canTest ? press(runTest) : {})} disabled={!canTest}
-          className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium cursor-pointer"
-          style={{ background: canTest ? t.accent : t.inputBg, color: canTest ? "#fff" : t.textFaint,
-            borderRadius: R - 3, cursor: canTest ? "pointer" : "not-allowed" }}>
-          <RefreshCw size={12} className={status.kind === "testing" ? "animate-spin" : undefined} />
-          检测连接
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11px] font-medium" style={{ color: t.textMuted }}>访问令牌</span>
+            <div className="flex items-center" style={{ ...inputStyle, paddingRight: 4 }}>
+              <input value={token} onChange={(e) => { setToken(e.target.value); setStatus({ kind: "idle" }); }}
+                type={showToken ? "text" : "password"} placeholder={tokenPlaceholder}
+                className="flex-1 text-xs px-2.5 py-2 outline-none font-mono bg-transparent" style={{ color: t.text }} />
+              <button {...press(() => setShowToken((v) => !v))} className="p-1.5 cursor-pointer flex-shrink-0"
+                style={{ color: t.textMuted }} title={showToken ? "隐藏" : "显示"}>
+                {showToken ? <EyeOff size={13} /> : <Eye size={13} />}
+              </button>
+            </div>
+            <span className="text-[10px]" style={{ color: t.textFaint }}>{hint}</span>
+          </div>
+
+          <div className="flex items-center gap-3 flex-wrap">
+            <button {...(canTest ? press(runTest) : {})} disabled={!canTest}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
+              style={{ background: t.inputBg, color: canTest ? t.text : t.textFaint,
+                border: `0.5px solid ${t.inputBorder}`, borderRadius: R - 3, cursor: canTest ? "pointer" : "not-allowed" }}>
+              <RefreshCw size={12} className={status.kind === "testing" ? "animate-spin" : undefined} />
+              检测连接
+            </button>
+            {status.kind === "ok" && (
+              <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.green }}>
+                <Check size={13} className="flex-shrink-0" />
+                <span className="truncate">已连接：{status.msg}</span>
+              </span>
+            )}
+            {status.kind === "err" && (
+              <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.red }}>
+                <AlertTriangle size={13} className="flex-shrink-0" />
+                <span className="truncate">{status.msg}</span>
+              </span>
+            )}
+            <div className="flex-1" />
+            <button {...press(cancelEdit)} className="px-3 py-1.5 text-xs cursor-pointer"
+              style={{ color: t.textMuted, borderRadius: R - 3 }}>取消</button>
+            <button {...(canSave ? press(saveNow) : {})} disabled={!canSave}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
+              style={{ background: canSave ? t.accent : t.inputBg, color: canSave ? "#fff" : t.textFaint,
+                borderRadius: R - 3, opacity: canSave ? 1 : 0.7, cursor: canSave ? "pointer" : "not-allowed" }}>
+              保存
+            </button>
+          </div>
+        </>
+      ) : (
+        <button {...press(beginEdit)}
+          className="flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium cursor-pointer transition-colors"
+          style={{ color: t.textSec, borderRadius: R - 2, border: `0.5px dashed ${t.inputBorder}` }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = t.rowHover; e.currentTarget.style.color = t.text; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = t.textSec; }}>
+          <Cloud size={13} /> 新增集成
         </button>
-        {status.kind === "ok" && (
-          <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.green }}>
-            <Check size={13} className="flex-shrink-0" />
-            <span className="truncate">已连接：{status.msg}</span>
-          </span>
-        )}
-        {status.kind === "err" && (
-          <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.red }}>
-            <AlertTriangle size={13} className="flex-shrink-0" />
-            <span className="truncate">{status.msg}</span>
-          </span>
-        )}
-      </div>
+      )}
     </div>
   );
 }
@@ -3095,12 +3286,15 @@ function GithubAccountsSettings() {
   const [token, setToken] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
   const [status, setStatus] = useState<{ kind: "idle" | "testing" | "ok" | "err"; msg?: string }>({ kind: "idle" });
+  // The form is only mounted while adding a new account or editing an existing one.
+  const showForm = adding || editingId !== null;
 
   useEffect(() => { saveGithubAccounts(accounts); }, [accounts]);
 
   const valid = token.trim().length > 0;
-  const reset = () => { setLabel(""); setUrl(""); setToken(""); setEditingId(null); setStatus({ kind: "idle" }); setShowToken(false); };
+  const reset = () => { setLabel(""); setUrl(""); setToken(""); setEditingId(null); setAdding(false); setStatus({ kind: "idle" }); setShowToken(false); };
   const submit = () => {
     if (!valid) return;
     const l = label.trim(), u = url.trim(), tk = token.trim();
@@ -3111,7 +3305,8 @@ function GithubAccountsSettings() {
     }
     reset();
   };
-  const startEdit = (a: GithubAccount) => { setEditingId(a.id); setLabel(a.label); setUrl(a.url); setToken(a.token); setStatus({ kind: "idle" }); };
+  const startAdd = () => { setEditingId(null); setLabel(""); setUrl(""); setToken(""); setStatus({ kind: "idle" }); setShowToken(false); setAdding(true); };
+  const startEdit = (a: GithubAccount) => { setAdding(false); setEditingId(a.id); setLabel(a.label); setUrl(a.url); setToken(a.token); setStatus({ kind: "idle" }); };
   const remove = (id: string) => { setAccounts((prev) => prev.filter((a) => a.id !== id)); if (editingId === id) reset(); };
 
   const canTest = token.trim().length > 0 && status.kind !== "testing";
@@ -3136,7 +3331,7 @@ function GithubAccountsSettings() {
 
       <div className="flex flex-col gap-1.5">
         {accounts.length === 0 && (
-          <div className="text-[11px] px-1 py-6 text-center" style={{ color: t.textFaint }}>还没有账号,在下方添加一个</div>
+          <div className="text-[11px] px-1 py-6 text-center" style={{ color: t.textFaint }}>还没有账号,点击「新增账号」添加</div>
         )}
         {accounts.map((a) => (
           <div key={a.id} className="group flex items-center gap-2.5 px-2.5 py-2"
@@ -3163,55 +3358,62 @@ function GithubAccountsSettings() {
         ))}
       </div>
 
-      <div className="flex flex-col gap-2 p-3" style={{ background: t.inputBg + "80", borderRadius: R - 1, border: `0.5px solid ${t.border}` }}>
-        <span className="text-[11px] font-semibold" style={{ color: t.textMuted }}>{editingId ? "编辑账号" : "添加账号"}</span>
-        <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="名称 / 备注(如 work、personal)"
-          className="text-xs px-2.5 py-2 outline-none" style={inputStyle} />
-        <input value={url} onChange={(e) => { setUrl(e.target.value); setStatus({ kind: "idle" }); }}
-          placeholder="实例地址(公有版留空,企业版填 https://ghe.example.com)"
-          className="text-xs px-2.5 py-2 outline-none font-mono" style={inputStyle} />
-        <div className="flex items-center" style={{ ...inputStyle, paddingRight: 4 }}>
-          <input value={token} onChange={(e) => { setToken(e.target.value); setStatus({ kind: "idle" }); }}
-            type={showToken ? "text" : "password"} placeholder="访问令牌 ghp_… / github_pat_…"
-            className="flex-1 text-xs px-2.5 py-2 outline-none font-mono bg-transparent" style={{ color: t.text }} />
-          <button {...press(() => setShowToken((v) => !v))} className="p-1.5 cursor-pointer flex-shrink-0"
-            style={{ color: t.textMuted }} title={showToken ? "隐藏" : "显示"}>
-            {showToken ? <EyeOff size={13} /> : <Eye size={13} />}
-          </button>
-        </div>
-        <span className="text-[10px]" style={{ color: t.textFaint }}>推送需 repo 权限。令牌存储在本地(后续可迁移到系统钥匙串)。</span>
-        <div className="flex items-center gap-3 flex-wrap">
-          <button {...(canTest ? press(runTest) : {})} disabled={!canTest}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
-            style={{ background: t.inputBg, color: canTest ? t.text : t.textFaint,
-              border: `0.5px solid ${t.inputBorder}`, borderRadius: R - 3, cursor: canTest ? "pointer" : "not-allowed" }}>
-            <RefreshCw size={12} className={status.kind === "testing" ? "animate-spin" : undefined} />
-            检测连接
-          </button>
-          {status.kind === "ok" && (
-            <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.green }}>
-              <Check size={13} className="flex-shrink-0" /><span className="truncate">已连接：{status.msg}</span>
-            </span>
-          )}
-          {status.kind === "err" && (
-            <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.red }}>
-              <AlertTriangle size={13} className="flex-shrink-0" /><span className="truncate">{status.msg}</span>
-            </span>
-          )}
-          <div className="flex-1" />
-          {editingId && (
+      {showForm ? (
+        <div className="flex flex-col gap-2 p-3" style={{ background: t.inputBg + "80", borderRadius: R - 1, border: `0.5px solid ${t.border}` }}>
+          <span className="text-[11px] font-semibold" style={{ color: t.textMuted }}>{editingId ? "编辑账号" : "新增账号"}</span>
+          <input value={label} autoFocus onChange={(e) => setLabel(e.target.value)} placeholder="名称 / 备注(如 work、personal)"
+            className="text-xs px-2.5 py-2 outline-none" style={inputStyle} />
+          <input value={url} onChange={(e) => { setUrl(e.target.value); setStatus({ kind: "idle" }); }}
+            placeholder="实例地址(公有版留空,企业版填 https://ghe.example.com)"
+            className="text-xs px-2.5 py-2 outline-none font-mono" style={inputStyle} />
+          <div className="flex items-center" style={{ ...inputStyle, paddingRight: 4 }}>
+            <input value={token} onChange={(e) => { setToken(e.target.value); setStatus({ kind: "idle" }); }}
+              type={showToken ? "text" : "password"} placeholder="访问令牌 ghp_… / github_pat_…"
+              className="flex-1 text-xs px-2.5 py-2 outline-none font-mono bg-transparent" style={{ color: t.text }} />
+            <button {...press(() => setShowToken((v) => !v))} className="p-1.5 cursor-pointer flex-shrink-0"
+              style={{ color: t.textMuted }} title={showToken ? "隐藏" : "显示"}>
+              {showToken ? <EyeOff size={13} /> : <Eye size={13} />}
+            </button>
+          </div>
+          <span className="text-[10px]" style={{ color: t.textFaint }}>推送需 repo 权限。令牌存储在本地(后续可迁移到系统钥匙串)。</span>
+          <div className="flex items-center gap-3 flex-wrap">
+            <button {...(canTest ? press(runTest) : {})} disabled={!canTest}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
+              style={{ background: t.inputBg, color: canTest ? t.text : t.textFaint,
+                border: `0.5px solid ${t.inputBorder}`, borderRadius: R - 3, cursor: canTest ? "pointer" : "not-allowed" }}>
+              <RefreshCw size={12} className={status.kind === "testing" ? "animate-spin" : undefined} />
+              检测连接
+            </button>
+            {status.kind === "ok" && (
+              <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.green }}>
+                <Check size={13} className="flex-shrink-0" /><span className="truncate">已连接：{status.msg}</span>
+              </span>
+            )}
+            {status.kind === "err" && (
+              <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.red }}>
+                <AlertTriangle size={13} className="flex-shrink-0" /><span className="truncate">{status.msg}</span>
+              </span>
+            )}
+            <div className="flex-1" />
             <button {...press(reset)} className="px-3 py-1.5 text-xs cursor-pointer"
               style={{ color: t.textMuted, borderRadius: R - 3 }}>取消</button>
-          )}
-          <button {...(valid ? press(submit) : {})} disabled={!valid}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
-            style={{ background: valid ? t.accent : t.inputBg, color: valid ? "#fff" : t.textFaint,
-              borderRadius: R - 3, opacity: valid ? 1 : 0.7, cursor: valid ? "pointer" : "not-allowed" }}>
-            {!editingId && <UserPlus size={12} />}
-            {editingId ? "保存" : "添加"}
-          </button>
+            <button {...(valid ? press(submit) : {})} disabled={!valid}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
+              style={{ background: valid ? t.accent : t.inputBg, color: valid ? "#fff" : t.textFaint,
+                borderRadius: R - 3, opacity: valid ? 1 : 0.7, cursor: valid ? "pointer" : "not-allowed" }}>
+              {editingId ? "保存" : "添加"}
+            </button>
+          </div>
         </div>
-      </div>
+      ) : (
+        <button {...press(startAdd)}
+          className="flex items-center justify-center gap-1.5 py-2.5 text-xs font-medium cursor-pointer transition-colors"
+          style={{ color: t.textSec, borderRadius: R - 2, border: `0.5px dashed ${t.inputBorder}` }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = t.rowHover; e.currentTarget.style.color = t.text; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = t.textSec; }}>
+          <UserPlus size={13} /> 新增账号
+        </button>
+      )}
     </div>
   );
 }
@@ -3229,33 +3431,6 @@ function AppearanceSettings({ vibrancy, setVibrancy, paletteId, setPaletteId, th
     ? window.matchMedia("(prefers-color-scheme: dark)").matches
     : themeMode === "dark";
   const MODES: ThemeMode[] = ["light", "dark", "system"];
-  type UpState =
-    | { kind: "idle" | "checking" | "uptodate" }
-    | { kind: "avail"; version: string; notes?: string; install: (p?: (n: number) => void) => Promise<void> }
-    | { kind: "downloading"; pct: number }
-    | { kind: "err"; msg: string };
-  const [up, setUp] = useState<UpState>({ kind: "idle" });
-
-  const check = async () => {
-    setUp({ kind: "checking" });
-    try {
-      const u = await checkForUpdate();
-      if (!u) { setUp({ kind: "uptodate" }); return; }
-      setUp({ kind: "avail", version: u.version, notes: u.notes, install: u.install });
-    } catch (e) {
-      setUp({ kind: "err", msg: String(e) });
-    }
-  };
-  const install = async () => {
-    if (up.kind !== "avail") return;
-    const doInstall = up.install;
-    setUp({ kind: "downloading", pct: 0 });
-    try {
-      await doInstall((p) => setUp({ kind: "downloading", pct: p }));
-    } catch (e) {
-      setUp({ kind: "err", msg: String(e) });
-    }
-  };
 
   return (
     <div className="flex flex-col gap-6">
@@ -3336,54 +3511,112 @@ function AppearanceSettings({ vibrancy, setVibrancy, paletteId, setPaletteId, th
         </span>
         <span className="text-xs" style={{ color: t.textSec }}>{vibrancy ? "已开启" : "已关闭"}</span>
       </button>
+    </div>
+  );
+}
 
-      <div style={{ height: "0.5px", background: t.border }} />
+// Second-level pane: current version + in-app update check (download / verify /
+// install / relaunch), split out from appearance into its own section.
+function UpdateSettings() {
+  const t = useTheme();
+  const [version, setVersion] = useState<string>("");
+  useEffect(() => { getAppVersion().then(setVersion).catch(() => {}); }, []);
 
-      {/* Update check */}
+  type UpState =
+    | { kind: "idle" | "checking" | "uptodate" }
+    | { kind: "avail"; version: string; notes?: string; install: (p?: (n: number) => void) => Promise<void> }
+    | { kind: "downloading"; pct: number }
+    | { kind: "err"; msg: string };
+  const [up, setUp] = useState<UpState>({ kind: "idle" });
+  const busy = up.kind === "checking" || up.kind === "downloading";
+
+  const check = async () => {
+    setUp({ kind: "checking" });
+    try {
+      const u = await checkForUpdate();
+      if (!u) { setUp({ kind: "uptodate" }); return; }
+      setUp({ kind: "avail", version: u.version, notes: u.notes, install: u.install });
+    } catch (e) {
+      setUp({ kind: "err", msg: String(e) });
+    }
+  };
+  const install = async () => {
+    if (up.kind !== "avail") return;
+    const doInstall = up.install;
+    setUp({ kind: "downloading", pct: 0 });
+    try {
+      await doInstall((p) => setUp({ kind: "downloading", pct: p }));
+    } catch (e) {
+      setUp({ kind: "err", msg: String(e) });
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-5">
       <div className="flex flex-col gap-1">
         <span className="text-sm font-semibold" style={{ color: t.text }}>软件更新</span>
         <span className="text-[11px]" style={{ color: t.textFaint }}>
           从发布服务器检查新版本。更新包经签名校验后下载、安装并重启。
         </span>
       </div>
-      <div className="flex items-center gap-3 -mt-3">
-        <button {...(up.kind === "checking" || up.kind === "downloading" ? {} : press(check))}
-          disabled={up.kind === "checking" || up.kind === "downloading"}
-          className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium"
+
+      {/* Current version card */}
+      <div className="flex items-center gap-3 px-3.5 py-3"
+        style={{ borderRadius: R - 2, border: `0.5px solid ${t.border}`, background: t.inputBg }}>
+        <div className="flex items-center justify-center rounded-xl flex-shrink-0"
+          style={{ width: 40, height: 40, background: t.accentBg }}>
+          <GitBranch size={18} style={{ color: t.accent }} />
+        </div>
+        <div className="flex flex-col min-w-0 flex-1">
+          <span className="text-xs font-semibold" style={{ color: t.text }}>GitKit</span>
+          <span className="text-[11px] font-mono" style={{ color: t.textMuted }}>
+            当前版本 {version ? `v${version}` : "—"}
+          </span>
+        </div>
+        <button {...(busy ? {} : press(check))} disabled={busy}
+          className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium flex-shrink-0"
           style={{ background: t.accent, color: "#fff", borderRadius: R - 3,
-            cursor: up.kind === "checking" || up.kind === "downloading" ? "not-allowed" : "pointer",
-            opacity: up.kind === "checking" || up.kind === "downloading" ? 0.6 : 1 }}>
+            cursor: busy ? "not-allowed" : "pointer", opacity: busy ? 0.6 : 1 }}>
           <RefreshCw size={12} className={up.kind === "checking" ? "animate-spin" : undefined} />
           检查更新
         </button>
-        {up.kind === "uptodate" && (
-          <span className="flex items-center gap-1.5 text-xs" style={{ color: t.green }}>
-            <Check size={13} /> 已是最新版本
-          </span>
-        )}
-        {up.kind === "avail" && (
-          <button {...press(install)}
-            className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium cursor-pointer"
-            style={{ background: t.green, color: "#fff", borderRadius: R - 3 }}>
-            <Download size={12} /> 下载并安装 v{up.version}
-          </button>
-        )}
-        {up.kind === "downloading" && (
-          <span className="text-xs" style={{ color: t.textSec }}>
-            下载中 {Math.round(up.pct * 100)}%
-          </span>
-        )}
-        {up.kind === "err" && (
-          <span className="flex items-center gap-1.5 text-xs min-w-0" style={{ color: t.red }}>
-            <AlertTriangle size={13} className="flex-shrink-0" />
-            <span className="truncate">{up.msg}</span>
-          </span>
-        )}
       </div>
-      {up.kind === "avail" && up.notes && (
-        <div className="text-[11px] whitespace-pre-wrap px-3 py-2"
-          style={{ color: t.textMuted, background: t.inputBg, borderRadius: R - 3, maxHeight: 160, overflow: "auto" }}>
-          {up.notes}
+
+      {/* Status line */}
+      {up.kind === "uptodate" && (
+        <div className="flex items-center gap-1.5 text-xs -mt-2" style={{ color: t.green }}>
+          <Check size={13} /> 已是最新版本
+        </div>
+      )}
+      {up.kind === "avail" && (
+        <div className="flex flex-col gap-2 -mt-2">
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="flex items-center gap-1.5 text-xs" style={{ color: t.text }}>
+              <DownloadCloud size={13} style={{ color: t.accent }} /> 发现新版本 v{up.version}
+            </span>
+            <button {...press(install)}
+              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium cursor-pointer"
+              style={{ background: t.green, color: "#fff", borderRadius: R - 3 }}>
+              <Download size={12} /> 下载并安装
+            </button>
+          </div>
+          {up.notes && (
+            <div className="text-[11px] whitespace-pre-wrap px-3 py-2"
+              style={{ color: t.textMuted, background: t.inputBg, borderRadius: R - 3, maxHeight: 160, overflow: "auto" }}>
+              {up.notes}
+            </div>
+          )}
+        </div>
+      )}
+      {up.kind === "downloading" && (
+        <div className="text-xs -mt-2" style={{ color: t.textSec }}>
+          下载中 {Math.round(up.pct * 100)}%
+        </div>
+      )}
+      {up.kind === "err" && (
+        <div className="flex items-center gap-1.5 text-xs min-w-0 -mt-2" style={{ color: t.red }}>
+          <AlertTriangle size={13} className="flex-shrink-0" />
+          <span className="truncate">{up.msg}</span>
         </div>
       )}
     </div>
@@ -3478,7 +3711,8 @@ function SettingsDialog({ identities, setIdentities, defaultId, setDefaultId, vi
     { key: "identity",   label: "提交者身份", Icon: Users },
     { key: "gitlab",     label: "GitLab 集成", Icon: Cloud },
     { key: "github",     label: "GitHub 集成", Icon: Github },
-    { key: "appearance", label: "外观与更新", Icon: Sparkles },
+    { key: "appearance", label: "外观", Icon: Sparkles },
+    { key: "update",     label: "软件更新", Icon: DownloadCloud },
     { key: "deps",       label: "环境依赖", Icon: TerminalSquare },
   ] as const;
   const [section, setSection] = useState<(typeof MENU)[number]["key"]>("identity");
@@ -3539,6 +3773,7 @@ function SettingsDialog({ identities, setIdentities, defaultId, setDefaultId, vi
                 paletteId={paletteId} setPaletteId={setPaletteId}
                 themeMode={themeMode} setThemeMode={setThemeMode} />
             )}
+            {section === "update" && <UpdateSettings />}
             {section === "deps" && <DependencySettings />}
           </div>
         </div>
@@ -3690,8 +3925,13 @@ export default function App() {
   const [cherryTarget, setCherryTarget] = useState<Commit | null>(null);
   const [cherryConflict, setCherryConflict] = useState<{ commit: Commit; target: string; files: string[] } | null>(null);
   const [createBranchOpen, setCreateBranchOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<Branch | null>(null);
+  const [deleteBranchTarget, setDeleteBranchTarget] = useState<{ branch: Branch; force: boolean } | null>(null);
+  const [deleteBranchBusy, setDeleteBranchBusy] = useState(false);
   const [tagDialogOpen, setTagDialogOpen] = useState(false);
   const [tagBusy, setTagBusy] = useState(false);
+  const [stashDialogOpen, setStashDialogOpen] = useState(false);
+  const [stashBusy, setStashBusy] = useState(false);
   const [confirmState, setConfirmState] = useState<null | {
     title: string; message: string; confirmLabel: string; onConfirm: () => Promise<void>;
   }>(null);
@@ -4088,17 +4328,26 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, dataReady]);
 
-  const doCreateBranch = async (name: string, base: string) => {
+  const doCreateBranch = async (name: string, base: string, mode: DirtyMode = "carry") => {
     if (!activeProject) return;
     setCreateBranchOpen(false);
+    const p = activeProject.path;
     try {
-      await createBranch(activeProject.path, name, base, true);
+      // Handle uncommitted changes first: stash them away, discard them, or (default)
+      // let `checkout -b` carry them onto the new branch.
+      if (mode === "stash") await stashPush(p, `GitKit: 新建分支 ${name} 前的改动`);
+      else if (mode === "discard") await discardAll(p);
+      await createBranch(p, name, base, true);
       setCurrentBranch(name);
-      setProjects((prev) => prev.map((p) => p.id === activeProjectId ? { ...p, branch: name } : p));
-      realCache.current.delete(activeProject.path);
+      setProjects((prev) => prev.map((pr) => pr.id === activeProjectId ? { ...pr, branch: name } : pr));
+      if (mode !== "carry") setSelectedWorkingFile(null);
+      realCache.current.delete(p);
       pendingViewReset.current = true;   // branch changed → reset to the new branch
       setReloadTick((n) => n + 1);
-      toast.success(`已创建并切换到分支 ${name}`);
+      toast.success(
+        mode === "stash" ? `已储藏改动并创建分支 ${name}`
+        : mode === "discard" ? `已放弃改动并创建分支 ${name}`
+        : `已创建并切换到分支 ${name}`);
     } catch (e) { toast.error(`创建分支失败：${e}`); }
   };
 
@@ -4134,17 +4383,26 @@ export default function App() {
   };
 
   // ── stash: save working changes, then apply / drop saved entries ──
-  const doStash = async () => {
+  // Open the stash dialog (optional title). Guard here so the button feedback
+  // still happens even though the actual stash runs from the dialog.
+  const requestStash = () => {
     if (!activeProject || gitBusy) return;
     if (changesCount === 0) { toast("没有可储藏的更改"); return; }
+    setStashDialogOpen(true);
+  };
+  const doStash = async (message = "") => {
+    if (!activeProject) return;
     const p = activeProject.path;
+    setStashBusy(true);
     const tid = toast.loading("正在储藏…");
     try {
-      await stashPush(p);
+      await stashPush(p, message);   // empty → backend default ("GitKit stash")
       realCache.current.delete(p);
       setReloadTick((n) => n + 1);
+      setStashDialogOpen(false);
       toast.success("已储藏当前更改", { id: tid });
     } catch (e) { toast.error(`储藏失败：${e}`, { id: tid }); }
+    finally { setStashBusy(false); }
   };
   const doStashApply = async (index: number) => {
     if (!activeProject) return;
@@ -4432,6 +4690,62 @@ export default function App() {
     } catch (e) { toast.error(`创建失败：${e}`, { id: tid }); }
   };
 
+  // ── local-branch rename / delete (sidebar right-click) ──
+  // Only local-only branches (no upstream) are renamable/deletable — a branch
+  // already synced to a remote is left alone to avoid diverging from origin.
+  const doRenameBranch = async (newName: string) => {
+    if (!renameTarget || !activeProject) return;
+    const b = renameTarget;
+    const p = activeProject.path;
+    setRenameTarget(null);
+    const tid = toast.loading(`正在重命名 ${b.name} → ${newName}…`);
+    try {
+      await renameBranch(p, b.name, newName);
+      if (currentBranch === b.name) {
+        setCurrentBranch(newName);
+        setProjects((prev) => prev.map((pr) => pr.id === activeProjectId ? { ...pr, branch: newName } : pr));
+      }
+      if (focusBranch === b.name) setFocus(newName);
+      // carry pinned / hidden membership over to the new name
+      setPinnedBranches((prev) => prev.map((n) => n === b.name ? newName : n));
+      setHiddenBranches((prev) => prev.map((n) => n === b.name ? newName : n));
+      realCache.current.delete(p);
+      setReloadTick((n) => n + 1);
+      toast.success(`已重命名为 ${newName}`, { id: tid });
+    } catch (e) { toast.error(`重命名失败：${e}`, { id: tid }); }
+  };
+
+  const requestDeleteBranch = (b: Branch) => {
+    if (!isReal || !activeProject) { toast("仅真实仓库支持删除分支"); return; }
+    if (b.current) { toast("无法删除当前所在分支,请先切换到其它分支"); return; }
+    if (b.remote) { toast("该分支已与远端同步,不可删除"); return; }
+    setDeleteBranchTarget({ branch: b, force: false });
+  };
+  const runDeleteBranch = async () => {
+    if (!deleteBranchTarget || !activeProject) return;
+    const { branch: b, force } = deleteBranchTarget;
+    const p = activeProject.path;
+    setDeleteBranchBusy(true);
+    try {
+      await deleteBranch(p, b.name, force);
+      if (focusBranch === b.name) setFocus(null);
+      realCache.current.delete(p);
+      setReloadTick((n) => n + 1);
+      setDeleteBranchTarget(null);
+      toast.success(`已删除分支 ${b.name}`);
+    } catch (e) {
+      // `git branch -d` refuses an unmerged branch → escalate to a force confirm
+      // rather than dead-ending, so the user can knowingly drop the commits.
+      if (!force && /not fully merged/i.test(String(e))) {
+        setDeleteBranchTarget({ branch: b, force: true });
+      } else {
+        toast.error(`删除失败：${e}`);
+      }
+    } finally {
+      setDeleteBranchBusy(false);
+    }
+  };
+
   const requestCherryPick = (commit: Commit) => setCherryTarget(commit);
   // Cherry-pick entry from the ActionBar: needs a commit open in the detail view.
   const requestCherryPickActive = () => {
@@ -4598,7 +4912,7 @@ export default function App() {
             onPush={activeProject ? () => runGitAction("push") : undefined}
             onCreateTag={activeProject ? () => setTagDialogOpen(true) : undefined}
             onCherryPick={activeProject ? requestCherryPickActive : undefined}
-            onStash={activeProject ? doStash : undefined}
+            onStash={activeProject ? requestStash : undefined}
             onCreatePR={activeProject ? requestCreatePR : undefined}
             pushCount={branches.find((b) => b.current)?.ahead ?? 0}
             busy={gitBusy} />
@@ -4635,6 +4949,19 @@ export default function App() {
               onShowAll={() => setFocus(null)}
               onHoverBranch={setHoverBranch}
               onCheckout={requestCheckout}
+              onBranchContext={(e, b) => {
+                const localOnly = !b.remote;   // no upstream → not synced to a remote
+                const items: CtxItem[] = [];
+                if (localOnly) {
+                  items.push({ label: "重命名分支", Icon: Pencil, onClick: () => setRenameTarget(b) });
+                  if (!b.current) {
+                    items.push({ label: "删除分支", Icon: Trash2, danger: true, onClick: () => requestDeleteBranch(b) });
+                  }
+                  items.push({ sep: true });
+                }
+                items.push({ label: "复制分支名", Icon: Copy, onClick: () => { navigator.clipboard.writeText(b.name).catch(() => {}); } });
+                openCtx(e, items);
+              }}
               onSyncRemote={requestSyncRemote}
               onRemoteContext={(e, remoteName, leaf) => {
                 const hasLocal = branches.some((b) => b.name === leaf);
@@ -4691,24 +5018,29 @@ export default function App() {
                   const sel = detailOpen && viewChanges;
                   return (
                   <div className="sticky top-0" style={{ zIndex: 20, background: theme.bg }}>
+                  {/* Amber identity — a left accent bar + tinted band + filled icon make
+                      the working-changes entry read as an actionable banner, not just
+                      another commit row. Colours come from theme.amber so it tracks the
+                      active palette (and stays legible in light & dark). */}
                   <button onClick={() => { setViewChanges(true); setSelectedWorkingFile(null); setSelectedStash(null); setSelectedStashFile(null); openDetail(); }}
-                    className="w-full flex items-center gap-2.5 px-3 py-2.5 cursor-pointer text-left"
+                    className="relative w-full flex items-center gap-2.5 px-3.5 py-2.5 cursor-pointer text-left transition-colors"
                     style={{ borderBottom: `0.5px solid ${theme.border}`,
-                      background: sel ? theme.rowSelected : "transparent" }}
-                    onMouseEnter={(e) => { if (!sel) e.currentTarget.style.background = theme.rowHover; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = sel ? theme.rowSelected : "transparent"; }}>
+                      background: sel ? theme.rowSelected : theme.amber + "14",
+                      boxShadow: `inset 3px 0 0 ${theme.amber}` }}
+                    onMouseEnter={(e) => { if (!sel) e.currentTarget.style.background = theme.amber + "24"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.background = sel ? theme.rowSelected : theme.amber + "14"; }}>
                     <div className="flex items-center justify-center rounded-full flex-shrink-0"
-                      style={{ width: 22, height: 22, background: theme.amber + "22" }}>
-                      <FileText size={12} style={{ color: theme.amber }} />
+                      style={{ width: 26, height: 26, background: theme.amber, boxShadow: `0 2px 6px ${theme.amber}55` }}>
+                      <FileText size={13} style={{ color: "#fff" }} />
                     </div>
                     <div className="flex flex-col min-w-0 flex-1">
-                      <span className="text-sm font-medium truncate"
+                      <span className="text-sm font-semibold truncate"
                         style={{ color: sel ? theme.accentFg : theme.text }}>未提交的更改</span>
                       <span className="text-[11px]" style={{ color: theme.textMuted }}>提交到 {currentBranch}</span>
                     </div>
                     <span className="flex items-center justify-center rounded-full text-[11px] font-bold flex-shrink-0"
-                      style={{ minWidth: 18, height: 18, padding: "0 5px",
-                        background: theme.amber, color: "#fff" }}>{changesCount}</span>
+                      style={{ minWidth: 20, height: 20, padding: "0 6px",
+                        background: theme.amber, color: "#fff", boxShadow: `0 0 0 3px ${theme.amber}22` }}>{changesCount}</span>
                   </button>
                   </div>
                   );
@@ -4877,8 +5209,33 @@ export default function App() {
         {createBranchOpen && (
           <CreateBranchDialog branches={branches}
             defaultBase={currentBranch || branches[0]?.name || ""}
+            dirty={changesCount > 0}
             onCancel={() => setCreateBranchOpen(false)}
             onConfirm={doCreateBranch} />
+        )}
+
+        {renameTarget && (
+          <RenameBranchDialog branch={renameTarget} branches={branches}
+            onCancel={() => setRenameTarget(null)}
+            onConfirm={doRenameBranch} />
+        )}
+
+        {stashDialogOpen && (
+          <StashDialog busy={stashBusy}
+            onCancel={() => { if (!stashBusy) setStashDialogOpen(false); }}
+            onConfirm={doStash} />
+        )}
+
+        {deleteBranchTarget && (
+          <ConfirmDialog
+            title={deleteBranchTarget.force ? "强制删除分支" : "删除分支"}
+            message={deleteBranchTarget.force
+              ? `分支 ${deleteBranchTarget.branch.name} 有未合并的提交,强制删除会永久丢失这些提交。确定继续?`
+              : `将删除本地分支 ${deleteBranchTarget.branch.name}。`}
+            confirmLabel={deleteBranchTarget.force ? "强制删除" : "删除"}
+            busy={deleteBranchBusy}
+            onCancel={() => { if (!deleteBranchBusy) setDeleteBranchTarget(null); }}
+            onConfirm={runDeleteBranch} />
         )}
 
         {createRepoOpen && activeProject && loadGithubAccounts().length > 0 && (
