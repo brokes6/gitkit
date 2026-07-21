@@ -9,13 +9,13 @@ import {
   Moon, Sun, Monitor, Plus, Minus, X, FolderOpen, ArrowRight,
   Pin, EyeOff, Eye, Folder, AlertTriangle, Cloud, GitBranchPlus, ChevronLeft, LayoutGrid,
   Settings, UserPlus, Trash2, Star, Users, Github, Laptop, Sparkles, RotateCcw, TerminalSquare,
-  Tag as TagIcon, Square, DownloadCloud, Pencil,
+  Tag as TagIcon, Square, DownloadCloud, Pencil, FolderGit2,
 } from "lucide-react";
 import {
   pickRepoFolder, openRepo, loadBranches, loadRemotes, loadHistory,
   loadStatus, loadCommitFiles, commitFileDiff, workingFileDiff, filePreview,
   attributeBranches, computeGraph, hasChanges, checkoutBranch, stashPush, stashList, stashApply, stashDrop, stashFiles, stashFileDiff, cherryPick, cherryPickPreflight,
-  createBranch, deleteBranch, renameBranch, checkoutSync, commit as gitCommit, fetchAll, pull, push, gitlabTest, githubTest,
+  createBranch, deleteBranch, renameBranch, removeWorktree, checkoutSync, commit as gitCommit, fetchAll, pull, push, gitlabTest, githubTest,
   createPullRequest, branchColor, setVibrancy, checkForUpdate, getAppVersion, discardFile, discardAll,
   checkDeps, mergePreview, loadTags, createTag, pushTag, githubCreateRepo, gitRemoteAdd,
   cloneRepo, pickCloneParent, repoNameFromUrl, startWatch, stopWatch,
@@ -422,7 +422,9 @@ export interface Commit {
   branchLabels?: string[];    // every branch whose first-parent backbone reaches here
   isStash?: boolean;          // stash tip — rendered as a single collapsed node
 }
-export interface Branch { name: string; remote?: string; ahead: number; behind: number; current: boolean; color: string; head?: string }
+// `worktree` — absolute path of the linked worktree holding this branch, when
+// one does. Such a branch can't be checked out or deleted until it's released.
+export interface Branch { name: string; remote?: string; ahead: number; behind: number; current: boolean; color: string; head?: string; worktree?: string }
 export interface Stash { index: number; message: string; date: string }
 export interface Remote { name: string; url: string; branches: string[] }
 export interface GraphRowInfo {
@@ -1004,7 +1006,9 @@ function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidde
         onContextMenu={(e) => onBranchContext?.(e, b)}
         className="group flex items-center gap-2 pr-2 cursor-pointer"
         style={{ ...itemStyle(active), background: baseBg, paddingLeft: indent ? 26 : 12, height: 30 }}
-        title={`单击只看此分支 · 双击切换到 ${b.name}`}
+        title={b.worktree
+          ? `${b.name}\n已被工作树占用：${b.worktree}\n无法直接切换或删除`
+          : `单击只看此分支 · 双击切换到 ${b.name}`}
         onMouseEnter={(e) => { onHoverBranch(b.name); if (!active) e.currentTarget.style.background = b.current ? currentBgHover : t.rowHover; }}
         onMouseLeave={(e) => { onHoverBranch(null); if (!active) e.currentTarget.style.background = baseBg; }}>
         <div className="w-2 h-2 rounded-full flex-shrink-0"
@@ -1014,6 +1018,10 @@ function Sidebar({ branches, remotes, stashes, currentBranch, focusBranch, hidde
           style={{ color: active ? t.accentFg : b.current ? t.text : t.textSec, fontWeight: b.current ? 600 : 400 }}>
           {leaf ?? b.name}
         </span>
+        {/* held by a linked worktree → neither checkout nor delete can proceed */}
+        {b.worktree && (
+          <FolderGit2 size={11} className="flex-shrink-0" style={{ color: t.textFaint }} />
+        )}
         {/* hover: pin / hide */}
         <div className="hidden group-hover:flex items-center gap-0.5 flex-shrink-0">
           <button onClick={(e) => { e.stopPropagation(); togglePin(b.name); }} className="p-0.5"
@@ -2179,22 +2187,49 @@ function loadDefaultIdentityId(): string {
   return localStorage.getItem("gitkit.defaultIdentityId") ?? "";
 }
 
+// Per-project preference maps (repo path → value), stored one JSON object per
+// storage key. Bad / missing JSON degrades to an empty map.
+function loadPrefMap(storeKey: string): Record<string, string> {
+  try {
+    const m = JSON.parse(localStorage.getItem(storeKey) ?? "{}");
+    return m && typeof m === "object" && !Array.isArray(m) ? m as Record<string, string> : {};
+  } catch { return {}; }
+}
+function setPrefMapEntry(storeKey: string, key: string, value: string): void {
+  if (!key) return;
+  const m = loadPrefMap(storeKey);
+  m[key] = value;
+  try { localStorage.setItem(storeKey, JSON.stringify(m)); } catch { /* ignore */ }
+}
+function deletePrefMapEntry(storeKey: string, key: string): void {
+  const m = loadPrefMap(storeKey);
+  delete m[key];
+  try { localStorage.setItem(storeKey, JSON.stringify(m)); } catch { /* ignore */ }
+}
+
+const IDENTITY_PREFS = "gitkit.projectIdentities";
+const ACCOUNT_PREFS  = "gitkit.projectGithubAccounts";
+
 // Remembered committer per repo path. Returns null when the project has no
 // remembered choice (→ fall back to the default identity); "" means the user
 // explicitly picked the repo/global git config for this project.
 function loadProjectIdentity(key: string): string | null {
-  try {
-    const m = JSON.parse(localStorage.getItem("gitkit.projectIdentities") ?? "{}");
-    return typeof m[key] === "string" ? m[key] : null;
-  } catch { return null; }
+  const v = loadPrefMap(IDENTITY_PREFS)[key];
+  return typeof v === "string" ? v : null;
 }
 function saveProjectIdentity(key: string, id: string): void {
-  if (!key) return;
-  try {
-    const m = JSON.parse(localStorage.getItem("gitkit.projectIdentities") ?? "{}");
-    m[key] = id;
-    localStorage.setItem("gitkit.projectIdentities", JSON.stringify(m));
-  } catch { /* ignore */ }
+  setPrefMapEntry(IDENTITY_PREFS, key, id);
+}
+
+// Remembered GitHub account per repo path — set from the "记住本项目的选择"
+// checkbox in the account picker, so a project with several matching accounts
+// stops asking. Cleared from 设置 › 项目配置.
+function loadProjectAccountId(key: string): string {
+  const v = loadPrefMap(ACCOUNT_PREFS)[key];
+  return typeof v === "string" ? v : "";
+}
+function saveProjectAccountId(key: string, id: string): void {
+  setPrefMapEntry(ACCOUNT_PREFS, key, id);
 }
 
 // Remote host connection (instance URL + personal access token), for GitLab / GitHub.
@@ -2447,6 +2482,64 @@ function CreateRepoDialog({ accounts, defaultName, busy, onCancel, onConfirm }: 
           placeholder="一句话说明这个仓库" className="text-xs px-2.5 py-2 outline-none"
           style={dlgCtl(t)} />
       </Field>
+    </Modal>
+  );
+}
+
+// ─── AccountPickerDialog (which GitHub identity to use for this remote op) ──
+// Shown when a remote matches 2+ configured accounts. Ticking 记住 stores the
+// choice for this repo path, so later actions skip the prompt.
+
+function AccountPickerDialog({ action, accounts, canRemember, onPick, onCancel }: {
+  action: string; accounts: GithubAccount[]; canRemember: boolean;
+  onPick: (account: GithubAccount, remember: boolean) => void;
+  onCancel: () => void;
+}) {
+  const t = useTheme();
+  const [remember, setRemember] = useState(false);
+
+  return (
+    <Modal title={`选择 GitHub 账号 · ${action}`} Icon={Github} onClose={onCancel} width={440}>
+      <span className="text-[11px]" style={{ color: t.textFaint }}>
+        该远程匹配到多个 GitHub 账号,选择本次{action}使用的身份。
+      </span>
+      <div className="flex flex-col gap-1.5">
+        {accounts.map((a) => {
+          const host = a.url ? hostOf(a.url) : "github.com";
+          return (
+            <button key={a.id} {...press(() => onPick(a, remember))}
+              className="flex items-center gap-2.5 px-3 py-2.5 text-left cursor-pointer transition-colors"
+              style={{ borderRadius: R - 2, border: `0.5px solid ${t.border}`, background: "transparent" }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = t.rowHover)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+              <div className="flex items-center justify-center rounded-full flex-shrink-0"
+                style={{ width: 26, height: 26, background: t.accentBg }}>
+                <Github size={13} style={{ color: t.accent }} />
+              </div>
+              <div className="flex flex-col min-w-0 flex-1">
+                <span className="text-xs font-medium truncate" style={{ color: t.text }}>{a.label || host}</span>
+                <span className="text-[11px] font-mono truncate" style={{ color: t.textMuted }}>{host} · ••••{a.token.slice(-4)}</span>
+              </div>
+              <ArrowRight size={14} className="flex-shrink-0" style={{ color: t.textFaint }} />
+            </button>
+          );
+        })}
+      </div>
+      {canRemember && (
+        <button {...press(() => setRemember((v) => !v))}
+          className="flex items-start gap-2 px-1 py-0.5 text-left cursor-pointer">
+          <div className="flex items-center justify-center flex-shrink-0" style={{
+            width: 14, height: 14, marginTop: 1, borderRadius: 4,
+            background: remember ? t.accent : "transparent",
+            border: `0.5px solid ${remember ? t.accent : t.inputBorder}` }}>
+            {remember && <Check size={10} strokeWidth={3} style={{ color: t.isDark ? "#0d0d0d" : "#fff" }} />}
+          </div>
+          <span className="text-[11px]" style={{ color: remember ? t.text : t.textMuted }}>
+            记住本项目的选择,以后不再询问
+            <span className="block" style={{ color: t.textFaint }}>可在设置 › 项目配置中查看或删除</span>
+          </span>
+        </button>
+      )}
     </Modal>
   );
 }
@@ -3307,7 +3400,15 @@ function GithubAccountsSettings() {
   };
   const startAdd = () => { setEditingId(null); setLabel(""); setUrl(""); setToken(""); setStatus({ kind: "idle" }); setShowToken(false); setAdding(true); };
   const startEdit = (a: GithubAccount) => { setAdding(false); setEditingId(a.id); setLabel(a.label); setUrl(a.url); setToken(a.token); setStatus({ kind: "idle" }); };
-  const remove = (id: string) => { setAccounts((prev) => prev.filter((a) => a.id !== id)); if (editingId === id) reset(); };
+  const remove = (id: string) => {
+    setAccounts((prev) => prev.filter((a) => a.id !== id));
+    // Drop per-project choices pointing at the deleted account, so they can't
+    // linger in 项目配置 as dangling entries.
+    for (const [path, accId] of Object.entries(loadPrefMap(ACCOUNT_PREFS))) {
+      if (accId === id) deletePrefMapEntry(ACCOUNT_PREFS, path);
+    }
+    if (editingId === id) reset();
+  };
 
   const canTest = token.trim().length > 0 && status.kind !== "testing";
   const runTest = async () => {
@@ -3698,6 +3799,110 @@ function DependencySettings() {
   );
 }
 
+// Per-project remembered choices (GitHub account for remote auth, committer
+// identity), collected from every pref map into one row per repo path so they
+// can be reviewed and cleared. Entries survive removing the project from the
+// sidebar, so this is the only place stale ones can be pruned.
+function ProjectPrefsSettings({ identities }: { identities: Identity[] }) {
+  const t = useTheme();
+  const accounts = loadGithubAccounts();
+  const projects = loadProjects();
+
+  const collect = () => {
+    const accMap = loadPrefMap(ACCOUNT_PREFS);
+    const idMap = loadPrefMap(IDENTITY_PREFS);
+    const paths = Array.from(new Set([...Object.keys(accMap), ...Object.keys(idMap)])).filter(Boolean);
+    return paths.map((path) => ({ path, accountId: accMap[path] ?? "", identityId: idMap[path] }))
+      .sort((a, b) => a.path.localeCompare(b.path));
+  };
+  const [rows, setRows] = useState(collect);
+
+  const clear = (path: string) => {
+    deletePrefMapEntry(ACCOUNT_PREFS, path);
+    deletePrefMapEntry(IDENTITY_PREFS, path);
+    setRows(collect);
+  };
+  const clearAll = () => {
+    for (const r of rows) { deletePrefMapEntry(ACCOUNT_PREFS, r.path); deletePrefMapEntry(IDENTITY_PREFS, r.path); }
+    setRows(collect);
+  };
+
+  const nameOf = (path: string) =>
+    projects.find((p) => p.path === path)?.name || path.split(/[/\\]/).filter(Boolean).pop() || path;
+  const accountLabel = (id: string) => {
+    if (!id) return null;
+    const a = accounts.find((x) => x.id === id);
+    if (!a) return "账号已删除";
+    return a.label || (a.url ? hostOf(a.url) : "github.com");
+  };
+  const identityLabel = (id: string | undefined) => {
+    if (id === undefined) return null;
+    if (id === "") return "仓库 / 全局 Git 配置";
+    const i = identities.find((x) => x.id === id);
+    return i ? `${i.name} <${i.email}>` : "身份已删除";
+  };
+  const chip = (label: string, value: string, stale: boolean) => (
+    <span className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] max-w-full"
+      style={{ borderRadius: R - 4, background: t.inputBg, color: stale ? t.textFaint : t.textMuted }}>
+      <span style={{ color: t.textFaint }}>{label}</span>
+      <span className="truncate" style={{ color: stale ? t.amber : t.textSec }}>{value}</span>
+    </span>
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1">
+        <span className="text-sm font-semibold" style={{ color: t.text }}>已保存的项目配置</span>
+        <span className="text-[11px]" style={{ color: t.textFaint }}>
+          这里是各个项目记住的选择：推送 / 拉取使用的 GitHub 账号,以及提交时使用的身份。删除后该项目会恢复为每次询问 / 使用默认身份。
+        </span>
+      </div>
+
+      <div className="flex flex-col gap-1.5">
+        {rows.length === 0 && (
+          <div className="text-[11px] px-1 py-6 text-center" style={{ color: t.textFaint }}>
+            还没有保存的项目配置。在账号选择弹窗中勾选「记住本项目的选择」即可保存
+          </div>
+        )}
+        {rows.map((r) => {
+          const acc = accountLabel(r.accountId);
+          const ident = identityLabel(r.identityId);
+          return (
+            <div key={r.path} className="group flex items-center gap-2.5 px-2.5 py-2"
+              style={{ borderRadius: R - 2, border: `0.5px solid ${t.border}` }}>
+              <div className="flex items-center justify-center rounded-full flex-shrink-0"
+                style={{ width: 26, height: 26, background: t.accentBg }}>
+                <FolderGit2 size={13} style={{ color: t.accent }} />
+              </div>
+              <div className="flex flex-col min-w-0 flex-1 gap-1">
+                <span className="text-xs font-medium truncate" style={{ color: t.text }}>{nameOf(r.path)}</span>
+                <span className="text-[10px] font-mono truncate" style={{ color: t.textFaint }}>{r.path}</span>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {acc && chip("GitHub", acc, acc === "账号已删除")}
+                  {ident && chip("提交者", ident, ident === "身份已删除")}
+                </div>
+              </div>
+              <button {...press(() => clear(r.path))} title="删除该项目的保存配置"
+                className="p-1 cursor-pointer opacity-0 group-hover:opacity-100"
+                style={{ color: t.textMuted, borderRadius: R - 4 }}>
+                <Trash2 size={13} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {rows.length > 1 && (
+        <button {...press(clearAll)}
+          className="self-start flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer"
+          style={{ background: t.inputBg, color: t.textMuted, border: `0.5px solid ${t.inputBorder}`, borderRadius: R - 3 }}>
+          <Trash2 size={12} />清空全部
+        </button>
+      )}
+    </div>
+  );
+}
+
 function SettingsDialog({ identities, setIdentities, defaultId, setDefaultId, vibrancy, setVibrancy,
   paletteId, setPaletteId, themeMode, setThemeMode, onClose }: {
   identities: Identity[]; setIdentities: React.Dispatch<React.SetStateAction<Identity[]>>;
@@ -3711,6 +3916,7 @@ function SettingsDialog({ identities, setIdentities, defaultId, setDefaultId, vi
     { key: "identity",   label: "提交者身份", Icon: Users },
     { key: "gitlab",     label: "GitLab 集成", Icon: Cloud },
     { key: "github",     label: "GitHub 集成", Icon: Github },
+    { key: "projects",   label: "项目配置", Icon: FolderGit2 },
     { key: "appearance", label: "外观", Icon: Sparkles },
     { key: "update",     label: "软件更新", Icon: DownloadCloud },
     { key: "deps",       label: "环境依赖", Icon: TerminalSquare },
@@ -3768,6 +3974,7 @@ function SettingsDialog({ identities, setIdentities, defaultId, setDefaultId, vi
                 test={gitlabTest} />
             )}
             {section === "github" && <GithubAccountsSettings />}
+            {section === "projects" && <ProjectPrefsSettings identities={identities} />}
             {section === "appearance" && (
               <AppearanceSettings vibrancy={vibrancy} setVibrancy={setVibrancy}
                 paletteId={paletteId} setPaletteId={setPaletteId}
@@ -3926,7 +4133,9 @@ export default function App() {
   const [cherryConflict, setCherryConflict] = useState<{ commit: Commit; target: string; files: string[] } | null>(null);
   const [createBranchOpen, setCreateBranchOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<Branch | null>(null);
-  const [deleteBranchTarget, setDeleteBranchTarget] = useState<{ branch: Branch; force: boolean } | null>(null);
+  // `worktree` set → the branch is held by a linked worktree; confirming also
+  // removes that worktree (destructive) before deleting the branch.
+  const [deleteBranchTarget, setDeleteBranchTarget] = useState<{ branch: Branch; force: boolean; worktree?: string } | null>(null);
   const [deleteBranchBusy, setDeleteBranchBusy] = useState(false);
   const [tagDialogOpen, setTagDialogOpen] = useState(false);
   const [tagBusy, setTagBusy] = useState(false);
@@ -4431,24 +4640,32 @@ export default function App() {
   };
 
   // GitHub multi-account picker. When a remote matches 2+ configured accounts,
-  // remote-auth actions (push/pull/fetch/tag/PR) prompt to choose one — no
-  // memory, every action re-asks. `chooseAccount` returns a promise the modal
-  // resolves; `resolveRemoteToken` wraps candidate selection + non-interactive
-  // fallback, returning null only when the user cancels the picker.
+  // remote-auth actions (push/pull/fetch/tag/PR) prompt to choose one, unless
+  // this project has a remembered choice (ticked in the picker, managed in
+  // 设置 › 项目配置). `chooseAccount` returns a promise the modal resolves;
+  // `resolveRemoteToken` wraps candidate selection + non-interactive fallback,
+  // returning null only when the user cancels the picker.
   const [acctPicker, setAcctPicker] = useState<
-    { action: string; accounts: GithubAccount[]; resolve: (a: GithubAccount | null) => void } | null
+    { action: string; accounts: GithubAccount[]; canRemember: boolean;
+      resolve: (r: { account: GithubAccount; remember: boolean } | null) => void } | null
   >(null);
-  const chooseAccount = (accounts: GithubAccount[], action: string) =>
-    new Promise<GithubAccount | null>((resolve) => setAcctPicker({ action, accounts, resolve }));
+  const chooseAccount = (accounts: GithubAccount[], action: string, canRemember: boolean) =>
+    new Promise<{ account: GithubAccount; remember: boolean } | null>(
+      (resolve) => setAcctPicker({ action, accounts, canRemember, resolve }));
   const resolveRemoteToken = async (
     remoteUrl: string,
     action: string,
   ): Promise<{ token?: string; account?: GithubAccount } | null> => {
     const cands = githubCandidates(remoteUrl);
     if (cands.length >= 2) {
-      const chosen = await chooseAccount(cands, action);
+      const key = activeProject?.path ?? "";
+      // A remembered account only applies while it still matches this remote.
+      const saved = key ? cands.find((a) => a.id === loadProjectAccountId(key)) : undefined;
+      if (saved) return { token: saved.token, account: saved };
+      const chosen = await chooseAccount(cands, action, !!key);
       if (!chosen) return null; // user cancelled
-      return { token: chosen.token, account: chosen };
+      if (chosen.remember && key) saveProjectAccountId(key, chosen.account.id);
+      return { token: chosen.account.token, account: chosen.account };
     }
     if (cands.length === 1) return { token: cands[0].token, account: cands[0] };
     return { token: pickRemoteToken(remoteUrl) };
@@ -4501,14 +4718,23 @@ export default function App() {
     setGitBusy(kind);
     const tid = toast.loading(`正在${verbs[kind]}…`);
     try {
-      if (kind === "fetch") await fetchAll(p, token);
-      else if (kind === "pull") await pull(p, token);
+      // A fetch also fast-forwards every local branch that is behind its
+      // upstream; report what it did (and what it deliberately left alone).
+      let detail: string | undefined;
+      if (kind === "fetch") {
+        const s = await fetchAll(p, token);
+        const parts: string[] = [];
+        if (s.synced.length) parts.push(`已同步 ${s.synced.length} 个分支：${s.synced.join("、")}`);
+        if (s.dirtySkipped) parts.push("当前分支有未提交更改,已跳过");
+        if (s.diverged.length) parts.push(`${s.diverged.join("、")} 与远程有分叉,需手动合并`);
+        detail = parts.join(" · ") || undefined;
+      } else if (kind === "pull") await pull(p, token);
       else await push(p, token);
       realCache.current.delete(p);
       // After a sync, jump to the newest commit (fetch/pull bring in new history).
       if (kind === "fetch" || kind === "pull") pendingJumpLatest.current = true;
       setReloadTick((n) => n + 1);
-      toast.success(`${verbs[kind]}完成`, { id: tid });
+      toast.success(`${verbs[kind]}完成`, { id: tid, description: detail });
     } catch (e) {
       toast.error(`${verbs[kind]}失败：${e}`, { id: tid });
     } finally {
@@ -4648,6 +4874,9 @@ export default function App() {
   const requestCheckout = async (branch: string) => {
     if (!isReal || !activeProject) { toast("仅真实仓库支持切换分支"); return; }
     if (branch === currentBranch) return;
+    // git refuses to check out a branch that another worktree already holds.
+    const wt = branches.find((b) => b.name === branch)?.worktree;
+    if (wt) { toast(`分支 ${branch} 正被工作树占用：${wt}`); return; }
     try {
       const dirty = await hasChanges(activeProject.path);
       if (dirty) setCheckoutTarget({ branch, dirty });
@@ -4719,14 +4948,21 @@ export default function App() {
     if (!isReal || !activeProject) { toast("仅真实仓库支持删除分支"); return; }
     if (b.current) { toast("无法删除当前所在分支,请先切换到其它分支"); return; }
     if (b.remote) { toast("该分支已与远端同步,不可删除"); return; }
-    setDeleteBranchTarget({ branch: b, force: false });
+    setDeleteBranchTarget({ branch: b, force: false, worktree: b.worktree });
   };
   const runDeleteBranch = async () => {
     if (!deleteBranchTarget || !activeProject) return;
-    const { branch: b, force } = deleteBranchTarget;
+    const { branch: b, force, worktree } = deleteBranchTarget;
     const p = activeProject.path;
     setDeleteBranchBusy(true);
+    // Once the worktree is gone the repo has already changed — every later exit
+    // path (success or failure) has to refresh and stop re-attempting removal.
+    let released = false;
     try {
+      // git refuses to delete a branch held by a worktree — even with -D — so
+      // release the worktree first. Confirmed in the dialog: this drops any
+      // uncommitted work inside it.
+      if (worktree) { await removeWorktree(p, worktree); released = true; }
       await deleteBranch(p, b.name, force);
       if (focusBranch === b.name) setFocus(null);
       realCache.current.delete(p);
@@ -4734,11 +4970,22 @@ export default function App() {
       setDeleteBranchTarget(null);
       toast.success(`已删除分支 ${b.name}`);
     } catch (e) {
+      const msg = String(e);
+      if (released) {
+        realCache.current.delete(p);
+        setReloadTick((n) => n + 1);
+      }
+      // Branch listing can be stale (a worktree added since the last refresh) —
+      // recover from the live error instead of dead-ending on it.
+      const wt = released ? undefined : msg.match(/正被工作树占用：(.+)/)?.[1]?.trim();
       // `git branch -d` refuses an unmerged branch → escalate to a force confirm
       // rather than dead-ending, so the user can knowingly drop the commits.
-      if (!force && /not fully merged/i.test(String(e))) {
+      if (wt) {
+        setDeleteBranchTarget({ branch: b, force, worktree: wt });
+      } else if (!force && /not fully merged/i.test(msg)) {
         setDeleteBranchTarget({ branch: b, force: true });
       } else {
+        if (released) setDeleteBranchTarget(null);
         toast.error(`删除失败：${e}`);
       }
     } finally {
@@ -4955,7 +5202,12 @@ export default function App() {
                 if (localOnly) {
                   items.push({ label: "重命名分支", Icon: Pencil, onClick: () => setRenameTarget(b) });
                   if (!b.current) {
-                    items.push({ label: "删除分支", Icon: Trash2, danger: true, onClick: () => requestDeleteBranch(b) });
+                    // A worktree-held branch is still deletable — the dialog
+                    // just adds the worktree removal as an explicit extra step.
+                    items.push({
+                      label: b.worktree ? "移除工作树并删除分支" : "删除分支",
+                      Icon: Trash2, danger: true, onClick: () => requestDeleteBranch(b),
+                    });
                   }
                   items.push({ sep: true });
                 }
@@ -5228,11 +5480,15 @@ export default function App() {
 
         {deleteBranchTarget && (
           <ConfirmDialog
-            title={deleteBranchTarget.force ? "强制删除分支" : "删除分支"}
-            message={deleteBranchTarget.force
+            title={deleteBranchTarget.worktree ? "移除工作树并删除分支"
+              : deleteBranchTarget.force ? "强制删除分支" : "删除分支"}
+            message={deleteBranchTarget.worktree
+              ? `分支 ${deleteBranchTarget.branch.name} 正被工作树占用：\n${deleteBranchTarget.worktree}\n\n继续将先移除该工作树，其中所有未提交的改动会永久丢失；若有程序（如 Claude Code 会话）正在使用它，也会一并中断。之后再删除分支${deleteBranchTarget.force ? "（含未合并的提交）" : ""}。`
+              : deleteBranchTarget.force
               ? `分支 ${deleteBranchTarget.branch.name} 有未合并的提交,强制删除会永久丢失这些提交。确定继续?`
               : `将删除本地分支 ${deleteBranchTarget.branch.name}。`}
-            confirmLabel={deleteBranchTarget.force ? "强制删除" : "删除"}
+            confirmLabel={deleteBranchTarget.worktree ? "移除工作树并删除"
+              : deleteBranchTarget.force ? "强制删除" : "删除"}
             busy={deleteBranchBusy}
             onCancel={() => { if (!deleteBranchBusy) setDeleteBranchTarget(null); }}
             onConfirm={runDeleteBranch} />
@@ -5312,35 +5568,10 @@ export default function App() {
         )}
 
         {acctPicker && (
-          <Modal title={`选择 GitHub 账号 · ${acctPicker.action}`} Icon={Github}
-            onClose={() => { acctPicker.resolve(null); setAcctPicker(null); }} width={440}>
-            <span className="text-[11px]" style={{ color: theme.textFaint }}>
-              该远程匹配到多个 GitHub 账号,选择本次{acctPicker.action}使用的身份。
-            </span>
-            <div className="flex flex-col gap-1.5">
-              {acctPicker.accounts.map((a) => {
-                const host = a.url ? hostOf(a.url) : "github.com";
-                return (
-                  <button key={a.id}
-                    {...press(() => { acctPicker.resolve(a); setAcctPicker(null); })}
-                    className="flex items-center gap-2.5 px-3 py-2.5 text-left cursor-pointer transition-colors"
-                    style={{ borderRadius: R - 2, border: `0.5px solid ${theme.border}`, background: "transparent" }}
-                    onMouseEnter={(e) => (e.currentTarget.style.background = theme.rowHover)}
-                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                    <div className="flex items-center justify-center rounded-full flex-shrink-0"
-                      style={{ width: 26, height: 26, background: theme.accentBg }}>
-                      <Github size={13} style={{ color: theme.accent }} />
-                    </div>
-                    <div className="flex flex-col min-w-0 flex-1">
-                      <span className="text-xs font-medium truncate" style={{ color: theme.text }}>{a.label || host}</span>
-                      <span className="text-[11px] font-mono truncate" style={{ color: theme.textMuted }}>{host} · ••••{a.token.slice(-4)}</span>
-                    </div>
-                    <ArrowRight size={14} className="flex-shrink-0" style={{ color: theme.textFaint }} />
-                  </button>
-                );
-              })}
-            </div>
-          </Modal>
+          <AccountPickerDialog action={acctPicker.action} accounts={acctPicker.accounts}
+            canRemember={acctPicker.canRemember}
+            onPick={(a, remember) => { acctPicker.resolve({ account: a, remember }); setAcctPicker(null); }}
+            onCancel={() => { acctPicker.resolve(null); setAcctPicker(null); }} />
         )}
 
         {confirmState && (

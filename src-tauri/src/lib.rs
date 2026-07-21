@@ -98,6 +98,7 @@ pub fn run() {
             git::git_create_branch,
             git::git_delete_branch,
             git::git_rename_branch,
+            git::git_remove_worktree,
             git::git_tags,
             git::git_create_tag,
             git::git_push_tag,

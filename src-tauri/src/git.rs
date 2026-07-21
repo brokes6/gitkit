@@ -147,6 +147,43 @@ pub struct BranchInfo {
     pub ahead: u32,
     pub behind: u32,
     pub is_remote: bool,
+    /// Absolute path of the *linked* worktree that has this branch checked out,
+    /// if any. Such a branch can be neither checked out nor deleted from the
+    /// main worktree until that worktree is removed.
+    pub worktree: Option<String>,
+}
+
+/// Map `refs/heads/<name>` → worktree path for every worktree **other than the
+/// one being browsed** (`git worktree list --porcelain`). The open worktree is
+/// excluded by comparing against its own top level, not by position: GitKit may
+/// have been pointed at a linked worktree rather than the main one, in which
+/// case it is the main worktree's branch that is blocked. Detached entries have
+/// no `branch` line and drop out; a failure here degrades to an empty map rather
+/// than breaking branch listing.
+fn linked_worktree_branches(path: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(out) = run_git(path, &["worktree", "list", "--porcelain"]) else {
+        return map;
+    };
+    let own = run_git(path, &["rev-parse", "--show-toplevel"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let mut cur: Option<String> = None;
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            cur = Some(p.trim().to_string());
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            match &cur {
+                Some(wt) if *wt != own => {
+                    map.insert(b.trim().to_string(), wt.clone());
+                }
+                _ => {}
+            }
+        } else if line.trim().is_empty() {
+            cur = None;
+        }
+    }
+    map
 }
 
 #[tauri::command]
@@ -162,6 +199,7 @@ pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
             "refs/remotes",
         ],
     )?;
+    let worktrees = linked_worktree_branches(&path);
     let mut res = Vec::new();
     for line in out.lines() {
         if line.is_empty() {
@@ -201,6 +239,11 @@ pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
                 }
             }
         }
+        let worktree = if is_remote {
+            None
+        } else {
+            worktrees.get(f[4]).cloned()
+        };
         res.push(BranchInfo {
             name,
             short_hash: f[1].to_string(),
@@ -210,6 +253,7 @@ pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
             ahead,
             behind,
             is_remote,
+            worktree,
         });
     }
     Ok(res)
@@ -839,20 +883,89 @@ where
         .map_err(|e| format!("任务失败：{e}"))?
 }
 
+/// What a fetch managed to sync, so the UI can say more than "done".
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchSummary {
+    /// Local branches fast-forwarded to their upstream.
+    pub synced: Vec<String>,
+    /// Branches left alone because local and remote have diverged.
+    pub diverged: Vec<String>,
+    /// True when the current branch was behind but the working tree is dirty.
+    pub dirty_skipped: bool,
+}
+
 /// Fetch all remotes (prune deleted remote branches). `token` (optional) is used
-/// for HTTP(S) auth against GitLab-style remotes. After fetching, fast-forward the
-/// current branch to its upstream when it's safe (behind, not diverged) so local
-/// stays in sync with the remote automatically.
+/// for HTTP(S) auth against GitLab-style remotes. After fetching, every local
+/// branch that is strictly behind its upstream is fast-forwarded, so a plain
+/// 获取 leaves local in sync with the remote:
+///   * diverged branches (any local-only commit) are never touched;
+///   * the current branch is skipped while the working tree is dirty;
+///   * branches checked out in a linked worktree are skipped (git refuses).
 #[tauri::command]
-pub async fn git_fetch(path: String, token: Option<String>) -> Result<(), String> {
+pub async fn git_fetch(path: String, token: Option<String>) -> Result<FetchSummary, String> {
     run_blocking(move || {
         run_git_auth(&path, &["fetch", "--all", "--prune"], token.as_deref())?;
-        // Best-effort fast-forward of the current branch to its upstream; ignore
-        // failures (no upstream / diverged / dirty tree) — the fetch still counts.
-        let _ = run_git_nohooks(&path, &["merge", "--ff-only", "@{u}"]);
-        Ok(())
+        Ok(sync_tracking_branches(&path))
     })
     .await
+}
+
+/// Fast-forward local branches onto their upstream after a fetch. Best-effort:
+/// every step is allowed to fail without failing the fetch itself.
+fn sync_tracking_branches(path: &str) -> FetchSummary {
+    let mut sum = FetchSummary::default();
+    let fmt = "%(refname:short)\x1f%(upstream)\x1f%(HEAD)";
+    let Ok(out) = run_git(path, &["for-each-ref", &format!("--format={fmt}"), "refs/heads"]) else {
+        return sum;
+    };
+    // Only read the working tree once — it can't change mid-sync.
+    let dirty = run_git(path, &["status", "--porcelain"]).map(|s| !s.trim().is_empty()).unwrap_or(true);
+    let worktrees = linked_worktree_branches(path);
+
+    for line in out.lines() {
+        let f: Vec<&str> = line.split('\x1f').collect();
+        if f.len() < 3 || f[1].is_empty() {
+            continue; // no upstream → nothing to sync to
+        }
+        let (name, upstream, current) = (f[0], f[1], f[2] == "*");
+        // Someone else's worktree owns this branch; leave it to that window.
+        if !current && worktrees.contains_key(&format!("refs/heads/{name}")) {
+            continue;
+        }
+        let Ok(counts) = run_git(path, &["rev-list", "--left-right", "--count", &format!("{name}...{upstream}")]) else {
+            continue;
+        };
+        let nums: Vec<u32> = counts.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+        if nums.len() != 2 {
+            continue;
+        }
+        let (ahead, behind) = (nums[0], nums[1]);
+        if behind == 0 {
+            continue; // already up to date (or only ahead — that's a push, not a fetch)
+        }
+        if ahead > 0 {
+            sum.diverged.push(name.to_string()); // needs a real merge/rebase; never auto-resolve
+            continue;
+        }
+        if current {
+            if dirty {
+                sum.dirty_skipped = true;
+                continue;
+            }
+            // Hooks off so a missing git-lfs can't fail an otherwise fine FF.
+            if run_git_nohooks(path, &["merge", "--ff-only", upstream]).is_ok() {
+                sum.synced.push(name.to_string());
+            }
+        } else {
+            // `fetch .` fast-forwards the ref without a checkout and refuses on
+            // non-FF or a branch checked out elsewhere — git enforces safety.
+            if run_git_nohooks(path, &["fetch", ".", &format!("{upstream}:refs/heads/{name}")]).is_ok() {
+                sum.synced.push(name.to_string());
+            }
+        }
+    }
+    sum
 }
 
 /// Check out `branch` and fast-forward it to `hash` (a remote commit), syncing the
@@ -957,8 +1070,67 @@ pub async fn git_delete_branch(path: String, name: String, force: bool) -> Resul
         if name.is_empty() {
             return Err("分支名称不能为空".into());
         }
-        run_git(&path, &["branch", if force { "-D" } else { "-d" }, name])?;
+        run_git(&path, &["branch", if force { "-D" } else { "-d" }, name]).map_err(|e| {
+            // A branch checked out in a linked worktree is refused even by `-D`.
+            // git's wording ("cannot delete branch 'x' used by worktree at 'y'")
+            // gives no way out, so name the real blocker and the path.
+            if let Some(wt) = worktree_path_from_error(&e) {
+                format!("分支 {name} 正被工作树占用：{wt}\n需要先移除该工作树才能删除分支。")
+            } else {
+                e
+            }
+        })?;
         Ok(())
+    })
+    .await
+}
+
+/// Whether `worktree` is still listed as a worktree of this repository.
+fn worktree_is_registered(path: &str, worktree: &str) -> bool {
+    match run_git(path, &["worktree", "list", "--porcelain"]) {
+        Ok(out) => out
+            .lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .any(|p| p.trim() == worktree),
+        // Can't tell → assume it's there so the caller still reports a failure.
+        Err(_) => true,
+    }
+}
+
+/// Pull the worktree path out of git's "used by worktree at '<path>'" error.
+fn worktree_path_from_error(err: &str) -> Option<String> {
+    let rest = err.split("used by worktree at ").nth(1)?;
+    let rest = rest.trim_start().strip_prefix('\'')?;
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+/// Remove a linked worktree (`git worktree remove --force`). `--force` is
+/// required because these worktrees are typically dirty — the caller is
+/// expected to have confirmed the loss of uncommitted work. If the directory is
+/// already gone but still registered, prune the stale record and retry.
+#[tauri::command]
+pub async fn git_remove_worktree(path: String, worktree: String) -> Result<(), String> {
+    run_blocking(move || {
+        let worktree = worktree.trim();
+        if worktree.is_empty() {
+            return Err("工作树路径不能为空".into());
+        }
+        match run_git(&path, &["worktree", "remove", "--force", worktree]) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = run_git(&path, &["worktree", "prune"]);
+                // Prune only clears *stale* records. If it dropped this one the
+                // job is done; otherwise the worktree really is still there and
+                // the original error is the useful one to surface.
+                if !worktree_is_registered(&path, worktree) {
+                    return Ok(());
+                }
+                run_git(&path, &["worktree", "remove", "--force", worktree])
+                    .map(|_| ())
+                    .map_err(|_| e)
+            }
+        }
     })
     .await
 }

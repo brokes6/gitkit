@@ -39,6 +39,7 @@ interface RBranch {
   ahead: number;
   behind: number;
   is_remote: boolean;
+  worktree: string | null;
 }
 interface RStatus {
   path: string;
@@ -283,6 +284,7 @@ export async function loadBranches(path: string): Promise<Branch[]> {
       current: b.current,
       color: branchColor(b.name),
       head: b.head_hash,
+      worktree: b.worktree ?? undefined,
     }));
 }
 
@@ -493,6 +495,12 @@ export async function deleteBranch(path: string, name: string, force = false): P
   await invoke("git_delete_branch", { path, name, force });
 }
 
+/** Remove a linked worktree (git worktree remove --force). Destructive: any
+ *  uncommitted work inside that worktree is lost. Frees the branch it holds. */
+export async function removeWorktree(path: string, worktree: string): Promise<void> {
+  await invoke("git_remove_worktree", { path, worktree });
+}
+
 /** Rename a local branch (git branch -m). Works on the current branch too. */
 export async function renameBranch(path: string, from: string, to: string): Promise<void> {
   await invoke("git_rename_branch", { path, from, to });
@@ -510,8 +518,19 @@ export async function commit(
   await invoke("git_commit", { path, message, files, name: name ?? null, email: email ?? null });
 }
 
-export async function fetchAll(path: string, token?: string): Promise<void> {
-  await invoke("git_fetch", { path, token: token ?? null });
+/**
+ * What a fetch synced. Local branches strictly behind their upstream are
+ * fast-forwarded; diverged ones are reported instead of touched, and the
+ * current branch is skipped while the working tree is dirty.
+ */
+export interface FetchSummary {
+  synced: string[];
+  diverged: string[];
+  dirtySkipped: boolean;
+}
+
+export async function fetchAll(path: string, token?: string): Promise<FetchSummary> {
+  return await invoke<FetchSummary>("git_fetch", { path, token: token ?? null });
 }
 
 export async function pull(path: string, token?: string): Promise<void> {
