@@ -5,7 +5,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 /// macOS GUI apps (launched from Finder/Dock) inherit a minimal PATH — usually
@@ -903,10 +904,39 @@ pub struct FetchSummary {
 ///   * the current branch is skipped while the working tree is dirty;
 ///   * branches checked out in a linked worktree are skipped (git refuses).
 #[tauri::command]
-pub async fn git_fetch(path: String, token: Option<String>) -> Result<FetchSummary, String> {
+pub async fn git_fetch(
+    cancels: tauri::State<'_, CancelState>,
+    path: String,
+    token: Option<String>,
+    op_id: String,
+    on_progress: tauri::ipc::Channel<GitProgress>,
+) -> Result<FetchSummary, String> {
+    let cancels = cancels.inner().clone();
     run_blocking(move || {
-        run_git_auth(&path, &["fetch", "--all", "--prune"], token.as_deref())?;
-        Ok(sync_tracking_branches(&path))
+        // Phase 1 — download from every remote, streaming git's own progress.
+        run_git_streaming(
+            &path,
+            &["fetch", "--all", "--prune", "--progress"],
+            token.as_deref(),
+            &op_id,
+            "获取中",
+            &on_progress,
+            &cancels,
+        )?;
+        // Phase 2 — fast-forward local branches. git prints nothing here, so
+        // announce it ourselves; otherwise the bar would stall on "接收对象 100%".
+        let _ = on_progress.send(GitProgress {
+            phase: "更新本地分支".into(),
+            percent: None,
+            raw: "正在更新本地分支…".into(),
+        });
+        let summary = sync_tracking_branches(&path);
+        let _ = on_progress.send(GitProgress {
+            phase: "完成".into(),
+            percent: Some(100),
+            raw: "获取完成".into(),
+        });
+        Ok(summary)
     })
     .await
 }
@@ -988,12 +1018,27 @@ pub async fn git_checkout_sync(path: String, branch: String, hash: String) -> Re
 
 /// Pull the current branch from its upstream.
 #[tauri::command]
-pub async fn git_pull(path: String, token: Option<String>) -> Result<(), String> {
+pub async fn git_pull(
+    cancels: tauri::State<'_, CancelState>,
+    path: String,
+    token: Option<String>,
+    op_id: String,
+    on_progress: tauri::ipc::Channel<GitProgress>,
+) -> Result<(), String> {
+    let cancels = cancels.inner().clone();
     run_blocking(move || {
         // Disable hooks (LFS post-merge/checkout) so a missing git-lfs can't fail a
-        // pull that otherwise succeeds; auth token still passes through.
-        run_git_auth(&path, &["-c", "core.hooksPath=/dev/null", "pull"], token.as_deref())?;
-        Ok(())
+        // pull that otherwise succeeds; auth token still passes through. Streamed so
+        // the UI shows the fetch phase's progress and can be cancelled.
+        run_git_streaming(
+            &path,
+            &["-c", "core.hooksPath=/dev/null", "pull", "--progress"],
+            token.as_deref(),
+            &op_id,
+            "拉取中",
+            &on_progress,
+            &cancels,
+        )
     })
     .await
 }
@@ -1777,8 +1822,11 @@ fn repo_name_from_url(url: &str) -> String {
     }
 }
 
-/// Map a `git clone --progress` line to a short Chinese phase label.
-fn clone_phase_label(line: &str) -> String {
+/// Map a `git --progress` line (clone/fetch/pull share the same transfer phases)
+/// to a short Chinese phase label. `fallback` is used for lines that carry no
+/// recognizable phase (e.g. "From github.com:…") — clone passes "克隆中", fetch
+/// "获取中", etc.
+fn transfer_phase_label(line: &str, fallback: &str) -> String {
     let label = if line.contains("Receiving objects") {
         "接收对象"
     } else if line.contains("Resolving deltas") {
@@ -1794,7 +1842,7 @@ fn clone_phase_label(line: &str) -> String {
     } else if line.starts_with("Cloning") {
         "准备克隆"
     } else {
-        "克隆中"
+        fallback
     };
     label.to_string()
 }
@@ -1811,6 +1859,142 @@ fn parse_clone_percent(line: &str) -> Option<u32> {
         return None;
     }
     line[start..pct].parse::<u32>().ok().map(|p| p.min(100))
+}
+
+/// One streamed progress update from a running fetch/pull, pushed to the
+/// frontend over a channel. Same shape as `CloneProgress`; kept separate so the
+/// two transfer flows can carry different phase vocabularies without coupling.
+#[derive(Clone, Serialize)]
+pub struct GitProgress {
+    pub phase: String,        // short Chinese label for the current step
+    pub percent: Option<u32>, // 0..=100 within the current step
+    pub raw: String,          // the raw git line, for a detail readout
+}
+
+/// A handle to one running, cancellable git subprocess plus the flag `git_cancel`
+/// sets to mark it user-cancelled (so the runner reports 取消 instead of failure).
+type CancelHandle = (Arc<Mutex<std::process::Child>>, Arc<AtomicBool>);
+
+/// Running, cancellable git subprocesses (fetch/pull) keyed by a frontend-supplied
+/// op id. Kept in Tauri managed state; `git_cancel(op_id)` looks the child up and
+/// kills it, which EOFs its stderr and unwinds the streaming loop. Wrapped in an
+/// `Arc` so a command can clone the map out of `State` and move it into the
+/// blocking worker thread.
+#[derive(Default, Clone)]
+pub struct CancelState(pub Arc<Mutex<HashMap<String, CancelHandle>>>);
+
+/// Sentinel error a cancelled op returns; the frontend maps it to a quiet "已取消"
+/// toast instead of a red failure.
+const CANCELLED: &str = "__cancelled__";
+
+/// Run a git command that reports `--progress` on stderr, streaming each line to
+/// the UI as a `GitProgress` and honoring cancellation via `CancelState`. Mirrors
+/// the streaming loop in `git_clone`. `fallback_phase` labels lines with no
+/// recognizable transfer phase. Registers the child under `op_id` so
+/// `git_cancel(op_id)` can kill it; returns `Err(CANCELLED)` when that happens.
+fn run_git_streaming(
+    repo: &str,
+    args: &[&str],
+    token: Option<&str>,
+    op_id: &str,
+    fallback_phase: &str,
+    on_progress: &tauri::ipc::Channel<GitProgress>,
+    cancels: &CancelState,
+) -> Result<(), String> {
+    let mut cmd = command("git");
+    cmd.arg("-C").arg(repo);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("PATH", augmented_path());
+    if let Some(tok) = token.filter(|s| !s.trim().is_empty()) {
+        cmd.env("GITKIT_GL_TOKEN", tok.trim());
+        cmd.arg("-c").arg("credential.helper=");
+        cmd.arg("-c")
+            .arg("credential.helper=!f() { echo username=oauth2; echo \"password=$GITKIT_GL_TOKEN\"; }; f");
+    }
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("无法执行 git：{e}"))?;
+    let stderr = child.stderr.take().ok_or("无法读取 git 输出")?;
+    let mut reader = std::io::BufReader::new(stderr);
+
+    // Register for cancellation. The `cancelled` flag distinguishes a user kill
+    // from a real failure regardless of the child's exit status.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let child = Arc::new(Mutex::new(child));
+    if let Ok(mut m) = cancels.0.lock() {
+        m.insert(op_id.to_string(), (child.clone(), cancelled.clone()));
+    }
+
+    // Same read-a-byte, split-on-\r-or-\n loop as clone: git refreshes progress
+    // in place with '\r'. The BufReader buffers the real syscalls.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    let mut tail: Vec<String> = Vec::new(); // recent lines, for an error message
+    loop {
+        match std::io::Read::read(&mut reader, &mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                let c = byte[0];
+                if c == b'\r' || c == b'\n' {
+                    if !buf.is_empty() {
+                        let line = String::from_utf8_lossy(&buf).trim().to_string();
+                        buf.clear();
+                        if !line.is_empty() {
+                            let _ = on_progress.send(GitProgress {
+                                phase: transfer_phase_label(&line, fallback_phase),
+                                percent: parse_clone_percent(&line),
+                                raw: line.clone(),
+                            });
+                            tail.push(line);
+                            if tail.len() > 10 {
+                                tail.remove(0);
+                            }
+                        }
+                    }
+                } else {
+                    buf.push(c);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Deregister, then reap. stderr EOF means the process is already exiting (on
+    // its own or via a cancel kill), so this wait() returns promptly.
+    if let Ok(mut m) = cancels.0.lock() {
+        m.remove(op_id);
+    }
+    let status = child.lock().unwrap().wait().map_err(|e| format!("git 执行失败：{e}"))?;
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(CANCELLED.into());
+    }
+    if !status.success() {
+        let msg = tail
+            .iter()
+            .rev()
+            .find(|l| l.contains("fatal") || l.contains("error"))
+            .cloned()
+            .or_else(|| tail.last().cloned())
+            .unwrap_or_else(|| "操作失败".into());
+        return Err(msg);
+    }
+    Ok(())
+}
+
+/// Cancel a running fetch/pull by op id: kill its subprocess and flag it so the
+/// runner reports a cancel rather than a failure. No-op if the op already ended.
+#[tauri::command]
+pub fn git_cancel(cancels: tauri::State<'_, CancelState>, op_id: String) -> Result<(), String> {
+    // Clone the handle out under the map lock, then release it before killing so
+    // we never hold the map lock across the child lock.
+    let entry = cancels.0.lock().map_err(|e| e.to_string())?.get(&op_id).cloned();
+    if let Some((child, flag)) = entry {
+        flag.store(true, Ordering::SeqCst);
+        let _ = child.lock().map(|mut c| c.kill());
+    }
+    Ok(())
 }
 
 /// Clone `url` into a NEW subdirectory of `dest` (the parent folder the user
@@ -1884,7 +2068,7 @@ pub async fn git_clone(
                             buf.clear();
                             if !line.is_empty() {
                                 let _ = on_progress.send(CloneProgress {
-                                    phase: clone_phase_label(&line),
+                                    phase: transfer_phase_label(&line, "克隆中"),
                                     percent: parse_clone_percent(&line),
                                     raw: line.clone(),
                                 });

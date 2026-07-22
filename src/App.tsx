@@ -19,8 +19,9 @@ import {
   createPullRequest, branchColor, setVibrancy, checkForUpdate, getAppVersion, discardFile, discardAll,
   checkDeps, mergePreview, loadTags, createTag, pushTag, githubCreateRepo, gitRemoteAdd,
   cloneRepo, pickCloneParent, repoNameFromUrl, startWatch, stopWatch,
+  cancelGitOp, isCancelled,
 } from "./git";
-import type { DepInfo, Tag, RepoInfo, CloneProgress } from "./git";
+import type { DepInfo, Tag, RepoInfo, CloneProgress, GitProgress } from "./git";
 
 // ─── theme ────────────────────────────────────────────────────────────────────
 
@@ -4155,6 +4156,9 @@ export default function App() {
   const gitBusyRef = useRef(gitBusy);
   gitBusyRef.current = gitBusy;
   const [busyLabel, setBusyLabel] = useState<string | null>(null); // generic blocking-op overlay
+  const [gitProg, setGitProg] = useState<GitProgress | null>(null); // live fetch/pull progress
+  const gitOpId = useRef<string | null>(null);                      // id of the running cancellable op
+  const [cancelling, setCancelling] = useState(false);              // cancel requested, awaiting unwind
   const realCache = useRef<Map<string, RealData>>(new Map());
   const lastLoadedPath = useRef<string | null>(null);   // to tell a switch from a refresh
   const pendingViewReset = useRef(false);                // branch-changing reloads force a view reset
@@ -4715,20 +4719,24 @@ export default function App() {
     const resolved = await resolveRemoteToken(originUrl, verbs[kind]);
     if (!resolved) return; // account picker cancelled
     const token = resolved.token;
+    const opId = crypto.randomUUID();
+    gitOpId.current = opId;
     setGitBusy(kind);
+    setGitProg(null);
+    setCancelling(false);
     const tid = toast.loading(`正在${verbs[kind]}…`);
     try {
       // A fetch also fast-forwards every local branch that is behind its
       // upstream; report what it did (and what it deliberately left alone).
       let detail: string | undefined;
       if (kind === "fetch") {
-        const s = await fetchAll(p, token);
+        const s = await fetchAll(p, token, opId, setGitProg);
         const parts: string[] = [];
         if (s.synced.length) parts.push(`已同步 ${s.synced.length} 个分支：${s.synced.join("、")}`);
         if (s.dirtySkipped) parts.push("当前分支有未提交更改,已跳过");
         if (s.diverged.length) parts.push(`${s.diverged.join("、")} 与远程有分叉,需手动合并`);
         detail = parts.join(" · ") || undefined;
-      } else if (kind === "pull") await pull(p, token);
+      } else if (kind === "pull") await pull(p, token, opId, setGitProg);
       else await push(p, token);
       realCache.current.delete(p);
       // After a sync, jump to the newest commit (fetch/pull bring in new history).
@@ -4736,10 +4744,24 @@ export default function App() {
       setReloadTick((n) => n + 1);
       toast.success(`${verbs[kind]}完成`, { id: tid, description: detail });
     } catch (e) {
-      toast.error(`${verbs[kind]}失败：${e}`, { id: tid });
+      // A user cancel isn't a failure — dismiss quietly.
+      if (isCancelled(e)) toast(`已取消${verbs[kind]}`, { id: tid });
+      else toast.error(`${verbs[kind]}失败：${e}`, { id: tid });
     } finally {
       setGitBusy(null);
+      setGitProg(null);
+      setCancelling(false);
+      gitOpId.current = null;
     }
+  };
+
+  // Cancel the in-flight fetch/pull. The backend kills the git subprocess, which
+  // unwinds runGitAction's await into the isCancelled branch above.
+  const cancelGitAction = async () => {
+    const id = gitOpId.current;
+    if (!id || cancelling) return;
+    setCancelling(true);
+    try { await cancelGitOp(id); } catch { /* already finished — the op will settle on its own */ }
   };
 
   // Commit staged files with the chosen identity (falls back to repo/global config).
@@ -5582,20 +5604,65 @@ export default function App() {
         )}
 
         {/* Global loading overlay for blocking git ops (blocks interaction, shows progress) */}
-        {(gitBusy || busyLabel) && (
-          <div className="fixed inset-0 flex items-center justify-center" style={{ zIndex: 300 }}>
-            <div className="absolute inset-0"
-              style={{ background: theme.scrim, backdropFilter: "blur(1.5px)" }} />
-            <div className="relative flex items-center gap-3 px-5 py-3.5"
-              style={{ background: theme.dialogBg,
-                border: `0.5px solid ${theme.glassBorder}`, borderRadius: R + 2, boxShadow: theme.shadowWindow }}>
-              <RefreshCw size={16} className="animate-spin" style={{ color: theme.accent }} />
-              <span className="text-sm font-medium" style={{ color: theme.text }}>
-                {gitBusy === "fetch" ? "正在获取…" : gitBusy === "pull" ? "正在拉取…" : gitBusy === "push" ? "正在推送…" : busyLabel}
-              </span>
+        {(gitBusy || busyLabel) && (() => {
+          // fetch/pull stream progress and can be cancelled; push + generic ops
+          // keep the simple spinner.
+          const cancellable = gitBusy === "fetch" || gitBusy === "pull";
+          const title = gitBusy === "fetch" ? "正在获取…" : gitBusy === "pull" ? "正在拉取…"
+            : gitBusy === "push" ? "正在推送…" : busyLabel;
+          const pct = gitProg?.percent;
+          return (
+            <div className="fixed inset-0 flex items-center justify-center" style={{ zIndex: 300 }}>
+              <div className="absolute inset-0"
+                style={{ background: theme.scrim, backdropFilter: "blur(1.5px)" }} />
+              {cancellable ? (
+                <div className="relative flex flex-col gap-2.5 px-5 py-4"
+                  style={{ width: 340, background: theme.dialogBg,
+                    border: `0.5px solid ${theme.glassBorder}`, borderRadius: R + 2, boxShadow: theme.shadowWindow }}>
+                  <div className="flex items-center gap-2.5">
+                    <RefreshCw size={15} className="animate-spin" style={{ color: theme.accent, flexShrink: 0 }} />
+                    <span className="text-sm font-medium flex-1" style={{ color: theme.text }}>{title}</span>
+                    <span className="text-xs font-mono tabular-nums" style={{ color: theme.textMuted }}>
+                      {pct != null ? `${pct}%` : ""}
+                    </span>
+                  </div>
+                  <div className="w-full overflow-hidden" style={{ height: 6, background: theme.inputBg, borderRadius: 999 }}>
+                    <div className={pct == null ? "animate-pulse" : undefined}
+                      style={{ height: "100%", width: pct != null ? `${pct}%` : "100%",
+                        background: theme.accent, borderRadius: 999, transition: "width 0.2s ease",
+                        opacity: pct != null ? 1 : 0.45 }} />
+                  </div>
+                  <div className="flex items-center gap-2 min-h-[16px]">
+                    <span className="text-[11px] flex-shrink-0" style={{ color: theme.textSec }}>
+                      {cancelling ? "正在取消…" : (gitProg?.phase ?? "正在连接远程…")}
+                    </span>
+                    {gitProg?.raw && !cancelling && (
+                      <span className="text-[10px] font-mono truncate flex-1" style={{ color: theme.textFaint }}>
+                        {gitProg.raw}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex justify-end pt-0.5">
+                    <button onClick={cancelGitAction} disabled={cancelling}
+                      className="px-3 py-1.5 text-xs font-medium"
+                      style={{ color: cancelling ? theme.textFaint : theme.textMuted, borderRadius: R - 2,
+                        border: `0.5px solid ${theme.inputBorder}`,
+                        cursor: cancelling ? "not-allowed" : "pointer" }}>
+                      取消
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="relative flex items-center gap-3 px-5 py-3.5"
+                  style={{ background: theme.dialogBg,
+                    border: `0.5px solid ${theme.glassBorder}`, borderRadius: R + 2, boxShadow: theme.shadowWindow }}>
+                  <RefreshCw size={16} className="animate-spin" style={{ color: theme.accent }} />
+                  <span className="text-sm font-medium" style={{ color: theme.text }}>{title}</span>
+                </div>
+              )}
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {ctxMenu && (
           <ContextMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxMenu.items} onClose={() => setCtxMenu(null)} />

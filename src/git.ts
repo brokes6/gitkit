@@ -529,12 +529,48 @@ export interface FetchSummary {
   dirtySkipped: boolean;
 }
 
-export async function fetchAll(path: string, token?: string): Promise<FetchSummary> {
-  return await invoke<FetchSummary>("git_fetch", { path, token: token ?? null });
+/** One streamed progress update from a running fetch/pull. `percent` is null on
+ *  lines that carry no percentage (kept in sync with Rust's GitProgress). */
+export interface GitProgress {
+  phase: string;
+  percent: number | null;
+  raw: string;
 }
 
-export async function pull(path: string, token?: string): Promise<void> {
-  await invoke("git_pull", { path, token: token ?? null });
+/** Fetch all remotes, streaming progress via `onProgress`. `opId` identifies the
+ *  op so it can be cancelled with {@link cancelGitOp}. */
+export async function fetchAll(
+  path: string,
+  token: string | undefined,
+  opId: string,
+  onProgress: (p: GitProgress) => void,
+): Promise<FetchSummary> {
+  const channel = new Channel<GitProgress>();
+  channel.onmessage = onProgress;
+  return await invoke<FetchSummary>("git_fetch", { path, token: token ?? null, opId, onProgress: channel });
+}
+
+/** Pull the current branch, streaming progress via `onProgress`. `opId` identifies
+ *  the op so it can be cancelled with {@link cancelGitOp}. */
+export async function pull(
+  path: string,
+  token: string | undefined,
+  opId: string,
+  onProgress: (p: GitProgress) => void,
+): Promise<void> {
+  const channel = new Channel<GitProgress>();
+  channel.onmessage = onProgress;
+  await invoke("git_pull", { path, token: token ?? null, opId, onProgress: channel });
+}
+
+/** Cancel a running fetch/pull by op id. Safe to call after it has finished. */
+export async function cancelGitOp(opId: string): Promise<void> {
+  await invoke("git_cancel", { opId });
+}
+
+/** True when an error came from the user cancelling the op (vs a real failure). */
+export function isCancelled(err: unknown): boolean {
+  return String(err).includes("__cancelled__");
 }
 
 export async function push(path: string, token?: string): Promise<void> {

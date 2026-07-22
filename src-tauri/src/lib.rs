@@ -34,6 +34,7 @@ fn set_vibrancy(window: tauri::WebviewWindow, enabled: bool) -> Result<(), Strin
 pub fn run() {
     tauri::Builder::default()
         .manage(git::WatchState::default())
+        .manage(git::CancelState::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Desktop-only plugins: window-state remembers window geometry
@@ -107,6 +108,7 @@ pub fn run() {
             git::git_fetch,
             git::git_pull,
             git::git_push,
+            git::git_cancel,
             git::gitlab_test,
             git::github_test,
             git::create_pull_request,
